@@ -275,105 +275,56 @@ loadSeedFromUrl()
 const canvas = document.getElementById('canvas');
 const m = canvas.getContext("2d");
 
-const wasmNumberType = 1;
-const wasmPageBytes = 65536;
-const wasmScratchOffset = 4096;
-const atomValueCount = 5;
-const atomByteStride = atomValueCount * Float64Array.BYTES_PER_ELEMENT;
-let rulesWasm = null;
-let rulesWasmMemory = null;
-let rulesWasmF64 = null;
+let serverStepInFlight = false;
+let serverStepFailed = false;
+let lineWarningShown = false;
 
-async function initRulesWasm() {
-    try {
-        const response = await fetch('life2d.wasm');
-        if (!response.ok) throw new Error(`Failed to load life2d.wasm: ${response.status}`);
-        const bytes = await response.arrayBuffer();
-        const result = await WebAssembly.instantiate(bytes, {});
-        rulesWasm = result.instance.exports;
-        rulesWasmMemory = rulesWasm.$;
-        rulesWasmF64 = new Float64Array(rulesWasmMemory.buffer);
-        console.log('WASM applyRules ready');
-    } catch (error) {
-        console.warn('WASM applyRules unavailable; using JS fallback.', error);
+function syncServerAtoms(nextAtoms) {
+    atoms.length = nextAtoms.length;
+    for (let i = 0; i < nextAtoms.length; i++) {
+        atoms[i] = nextAtoms[i];
     }
 }
 
-function ensureRulesWasmLayout() {
-    const atomsPtr = wasmScratchOffset;
-    const rulesPtr = atomsPtr + atoms.length * atomByteStride;
-    const radii2Ptr = rulesPtr + settings.rulesArray.length * Float64Array.BYTES_PER_ELEMENT;
-    const requiredBytes = radii2Ptr + settings.radii2Array.length * Float64Array.BYTES_PER_ELEMENT;
-    const requiredPages = Math.ceil(requiredBytes / wasmPageBytes);
-    const currentPages = rulesWasmMemory.buffer.byteLength / wasmPageBytes;
+function applyRulesOnServer() {
+    if (serverStepInFlight || serverStepFailed) return;
 
-    if (requiredPages > currentPages) {
-        rulesWasmMemory.grow(requiredPages - currentPages);
-        rulesWasmF64 = new Float64Array(rulesWasmMemory.buffer);
-    }
-
-    return {
-        atomsPtr,
-        rulesPtr,
-        radii2Ptr,
-        atomsIndex: atomsPtr / Float64Array.BYTES_PER_ELEMENT,
-        rulesIndex: rulesPtr / Float64Array.BYTES_PER_ELEMENT,
-        radii2Index: radii2Ptr / Float64Array.BYTES_PER_ELEMENT,
-    };
+    serverStepInFlight = true;
+    fetch('/api/apply-rules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            atoms,
+            rulesArray: settings.rulesArray,
+            radii2Array: settings.radii2Array,
+            numColors: settings.numColors,
+            pulse,
+            pulseX: pulse_x,
+            pulseY: pulse_y,
+            timeScale: settings.time_scale,
+            wallRepel: settings.wallRepel,
+            canvasWidth: canvas.width,
+            canvasHeight: canvas.height,
+            gravity: settings.gravity,
+            viscosity: settings.viscosity,
+        }),
+    })
+        .then(response => {
+            if (!response.ok) throw new Error(`Server applyRules failed: ${response.status}`);
+            return response.json();
+        })
+        .then(result => {
+            total_v = result.totalV;
+            syncServerAtoms(result.atoms);
+        })
+        .catch(error => {
+            serverStepFailed = true;
+            console.warn('Server applyRules unavailable; simulation paused.', error);
+        })
+        .finally(() => {
+            serverStepInFlight = false;
+        });
 }
-
-function syncRulesWasmInputs(layout) {
-    let atomOffset = layout.atomsIndex;
-    for (const atom of atoms) {
-        rulesWasmF64[atomOffset] = atom[0];
-        rulesWasmF64[atomOffset + 1] = atom[1];
-        rulesWasmF64[atomOffset + 2] = atom[2];
-        rulesWasmF64[atomOffset + 3] = atom[3];
-        rulesWasmF64[atomOffset + 4] = atom[4];
-        atomOffset += atomValueCount;
-    }
-
-    rulesWasmF64.set(settings.rulesArray, layout.rulesIndex);
-    rulesWasmF64.set(settings.radii2Array, layout.radii2Index);
-}
-
-function syncRulesWasmAtoms(layout) {
-    let atomOffset = layout.atomsIndex;
-    for (const atom of atoms) {
-        atom[0] = rulesWasmF64[atomOffset];
-        atom[1] = rulesWasmF64[atomOffset + 1];
-        atom[2] = rulesWasmF64[atomOffset + 2];
-        atom[3] = rulesWasmF64[atomOffset + 3];
-        atomOffset += atomValueCount;
-    }
-}
-
-function applyRulesWithWasm() {
-    const layout = ensureRulesWasmLayout();
-    syncRulesWasmInputs(layout);
-
-    const result = rulesWasm.applyRulesWasm(
-        layout.atomsPtr, wasmNumberType,
-        atoms.length, wasmNumberType,
-        layout.rulesPtr, wasmNumberType,
-        layout.radii2Ptr, wasmNumberType,
-        settings.numColors, wasmNumberType,
-        pulse, wasmNumberType,
-        pulse_x, wasmNumberType,
-        pulse_y, wasmNumberType,
-        settings.time_scale, wasmNumberType,
-        settings.wallRepel, wasmNumberType,
-        canvas.width, wasmNumberType,
-        canvas.height, wasmNumberType,
-        settings.gravity, wasmNumberType,
-        settings.viscosity, wasmNumberType
-    );
-
-    total_v = Array.isArray(result) ? result[0] : result;
-    syncRulesWasmAtoms(layout);
-}
-
-initRulesWasm();
 // Draw a square
 const drawSquare = (x, y, color, radius) => {
     m.fillStyle = color;
@@ -525,92 +476,16 @@ function exploreParameters() {
     exploration_timer -= 1;
 }
 
-var total_v; // global velocity as a estimate of on-screen activity
+var total_v = 0; // global velocity as a estimate of on-screen activity
 
 // Apply Rules ( How atoms interact with each other )
 const applyRules = () => {
-    if (rulesWasm !== null && !settings.drawings.lines) {
-        applyRulesWithWasm();
-        return;
+    if (settings.drawings.lines && !lineWarningShown) {
+        console.warn('Draw Lines is disabled while applyRules runs on the server.');
+        lineWarningShown = true;
     }
 
-    total_v = 0.;
-    // update velocity first
-    for (const a of atoms) {
-        let fx = 0;
-        let fy = 0;
-        const idx = a[4] * settings.numColors;
-        const r2 = settings.radii2Array[a[4]]
-        for (const b of atoms) {
-            const g = settings.rulesArray[idx + b[4]];
-            const dx = a[0] - b[0];
-            const dy = a[1] - b[1];
-            if (dx !== 0 || dy !== 0) {
-                const d = dx * dx + dy * dy;
-                if (d < r2) {
-                    const F = g / Math.sqrt(d);
-                    fx += F * dx;
-                    fy += F * dy;
-
-                    // Draw lines between atoms that are effecting each other.
-                    if (settings.drawings.lines) {
-                        drawLineBetweenAtoms(a[0], a[1], b[0], b[1], settings.colors[b[4]]);
-                    }
-                }
-            }
-        }
-        if (pulse != 0) {
-            const dx = a[0] - pulse_x;
-            const dy = a[1] - pulse_y;
-            const d = dx * dx + dy * dy;
-            if (d > 0) {
-                const F = 100. * pulse / (d * settings.time_scale);
-                fx += F * dx;
-                fy += F * dy;
-            }
-        }
-        if (settings.wallRepel > 0) {
-          const d = settings.wallRepel
-          const strength = 0.1
-          if (a[0] <                d) fx += (d -                a[0]) * strength
-          if (a[0] > canvas.width - d) fx += (canvas.width - d - a[0]) * strength
-          if (a[1] <                 d) fy += (d                 - a[1]) * strength
-          if (a[1] > canvas.height - d) fy += (canvas.height - d - a[1]) * strength
-        }
-        fy += settings.gravity;
-        const vmix = (1. - settings.viscosity);
-        a[2] = a[2] * vmix + fx * settings.time_scale;
-        a[3] = a[3] * vmix + fy * settings.time_scale;
-        // record typical activity, so that we can scale the
-        // time_scale later accordingly
-        total_v += Math.abs(a[2]);
-        total_v += Math.abs(a[3]);
-    }
-    // update positions now
-    for (const a of atoms) {
-        a[0] += a[2]
-        a[1] += a[3]
-
-        // When Atoms touch or bypass canvas borders
-        if (a[0] < 0) {
-            a[0] = -a[0];
-            a[2] *= -1;
-        }
-        if (a[0] >= canvas.width) {
-            a[0] = 2 * canvas.width - a[0];
-            a[2] *= -1;
-        }
-        if (a[1] < 0) {
-            a[1] = -a[1];
-            a[3] *= -1;
-        }
-        if (a[1] >= canvas.height) {
-            a[1] = 2 * canvas.height - a[1];
-            a[3] *= -1;
-        }
-
-    }
-    total_v /= atoms.length;
+    applyRulesOnServer();
 };
 
 
