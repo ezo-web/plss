@@ -1,9 +1,19 @@
 const http = require("node:http");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const {
+  Worker,
+  isMainThread,
+  parentPort,
+  workerData,
+} = require("node:worker_threads");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 8000);
+const wasmPath = isMainThread
+  ? path.join(root, "life2d.wasm")
+  : workerData.wasmPath;
 const wasmNumberType = 1;
 const wasmPageBytes = 65536;
 const wasmScratchOffset = 4096;
@@ -26,7 +36,7 @@ const csp = [
   "media-src 'self' blob:",
 ].join("; ");
 
-const wasmBytes = fs.readFileSync(path.join(root, "life2d.wasm"));
+const wasmBytes = fs.readFileSync(wasmPath);
 const wasmInstance = new WebAssembly.Instance(
   new WebAssembly.Module(wasmBytes),
   {},
@@ -158,6 +168,131 @@ function applyRulesOnServer(input) {
   };
 }
 
+if (!isMainThread) {
+  parentPort.on("message", ({ id, input }) => {
+    try {
+      parentPort.postMessage({ id, result: applyRulesOnServer(input) });
+    } catch (error) {
+      parentPort.postMessage({
+        id,
+        error: error instanceof Error ? error.stack || error.message : error,
+      });
+    }
+  });
+  return;
+}
+
+function getRuleWorkerCount() {
+  const configuredCount = Number(process.env.RULE_WORKERS);
+  if (Number.isInteger(configuredCount) && configuredCount > 0) {
+    return configuredCount;
+  }
+
+  const availableParallelism =
+    typeof os.availableParallelism === "function"
+      ? os.availableParallelism()
+      : os.cpus().length;
+
+  return Math.max(1, availableParallelism - 1);
+}
+
+class RuleWorkerPool {
+  constructor(size) {
+    this.size = size;
+    this.nextJobId = 1;
+    this.queue = [];
+    this.workers = Array.from({ length: size }, (_, index) =>
+      this.createWorker(index),
+    );
+  }
+
+  createWorker(index) {
+    const slot = {
+      index,
+      worker: null,
+      busy: false,
+      currentJob: null,
+    };
+
+    const spawn = () => {
+      slot.worker = new Worker(__filename, {
+        workerData: { wasmPath },
+      });
+
+      slot.worker.on("message", (message) => {
+        const job = slot.currentJob;
+        if (!job || job.id !== message.id) return;
+
+        if (message.error) {
+          job.reject(new Error(String(message.error)));
+        } else {
+          job.resolve(message.result);
+        }
+
+        slot.busy = false;
+        slot.currentJob = null;
+        this.pump();
+      });
+
+      slot.worker.on("error", (error) => {
+        if (slot.currentJob) slot.currentJob.reject(error);
+        slot.busy = false;
+        slot.currentJob = null;
+      });
+
+      slot.worker.on("exit", (code) => {
+        if (slot.currentJob) {
+          slot.currentJob.reject(
+            new Error(`Rule worker exited with code ${code}`),
+          );
+        }
+        slot.busy = false;
+        slot.currentJob = null;
+        if (code !== 0) spawn();
+        this.pump();
+      });
+    };
+
+    spawn();
+    return slot;
+  }
+
+  run(input) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({
+        id: this.nextJobId++,
+        input,
+        resolve,
+        reject,
+      });
+      this.pump();
+    });
+  }
+
+  pump() {
+    while (this.queue.length > 0) {
+      const slot = this.workers.find((workerSlot) => !workerSlot.busy);
+      if (!slot) return;
+
+      const job = this.queue.shift();
+      slot.busy = true;
+      slot.currentJob = job;
+      slot.worker.postMessage({
+        id: job.id,
+        input: job.input,
+      });
+    }
+  }
+
+  close() {
+    for (const slot of this.workers) {
+      slot.worker.terminate();
+    }
+  }
+}
+
+const ruleWorkerPool = new RuleWorkerPool(getRuleWorkerCount());
+
 function readJsonBody(request, callback) {
   let body = "";
 
@@ -189,21 +324,24 @@ const server = http.createServer((request, response) => {
         return;
       }
 
-      try {
-        send(response, 200, JSON.stringify(applyRulesOnServer(input)), {
-          "Content-Type": "application/json; charset=utf-8",
-        });
-      } catch (applyError) {
-        console.error(applyError);
-        send(
-          response,
-          500,
-          JSON.stringify({ error: "Failed to apply rules" }),
-          {
+      ruleWorkerPool
+        .run(input)
+        .then((result) => {
+          send(response, 200, JSON.stringify(result), {
             "Content-Type": "application/json; charset=utf-8",
-          },
-        );
-      }
+          });
+        })
+        .catch((applyError) => {
+          console.error(applyError);
+          send(
+            response,
+            500,
+            JSON.stringify({ error: "Failed to apply rules" }),
+            {
+              "Content-Type": "application/json; charset=utf-8",
+            },
+          );
+        });
     });
     return;
   }
@@ -231,5 +369,15 @@ const server = http.createServer((request, response) => {
 });
 
 server.listen(port, () => {
-  console.log(`Serving Life on port ${port}`);
+  console.log(
+    `Serving Life on port ${port} with ${ruleWorkerPool.size} rule workers`,
+  );
 });
+
+function shutdown() {
+  ruleWorkerPool.close();
+  server.close(() => process.exit(0));
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);

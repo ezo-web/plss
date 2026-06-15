@@ -12,6 +12,7 @@ const predefinedColors = [
   "yellow",
   "blue",
   "white",
+  "lime",
 ];
 const settings = {
   seed: 91651088029,
@@ -121,7 +122,7 @@ const setupGUI = () => {
   configFolder.add(settings, "randomRules").name("Random Rules");
   configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
   configFolder
-    .add(settings, "numColors", 1, 10, 1)
+    .add(settings, "numColors", 1, 11, 1)
     .name("Number of Colors")
     .listen()
     .onFinishChange((v) => {
@@ -154,6 +155,10 @@ const setupGUI = () => {
 
   configFolder.add(settings, "gravity", 0, 1, 0.05).name("Gravity").listen();
   configFolder
+    .add(settings, "explorePeriod", 1, 500, 1)
+    .name("Mutation Frequency")
+    .listen();
+  configFolder
     .add(settings, "pulseDuration", 1, 100, 1)
     .name("Click Pulse Duration")
     .listen();
@@ -162,7 +167,7 @@ const setupGUI = () => {
     .add(settings, "wallRepel", 0, 100, 1)
     .name("Wall Repel")
     .listen();
-  configFolder.add(settings, "explore").name("Random Exploration").listen();
+  configFolder.add(settings, "explore").name("Random Mutations").listen();
   // Drawings
   const drawingsFolder = settings.gui.addFolder("Drawings");
   drawingsFolder
