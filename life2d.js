@@ -46,6 +46,8 @@ const settings = {
   },
   explore: false,
   explorePeriod: 100,
+  chunkedThreads: false,
+  particleSetSize: 100,
   rules: {},
   rulesArray: [],
   radii: {},
@@ -168,6 +170,21 @@ const setupGUI = () => {
     .name("Wall Repel")
     .listen();
   configFolder.add(settings, "explore").name("Random Mutations").listen();
+  configFolder
+    .add(settings, "chunkedThreads")
+    .name("Chunked Threads")
+    .listen()
+    .onFinishChange(() => {
+      invalidateServerStep();
+    });
+  configFolder
+    .add(settings, "particleSetSize", 20, 1000, 20)
+    .name("Particles per Thread")
+    .listen()
+    .onFinishChange((v) => {
+      settings.particleSetSize = Math.max(1, Math.floor(v));
+      invalidateServerStep();
+    });
   // Drawings
   const drawingsFolder = settings.gui.addFolder("Drawings");
   drawingsFolder
@@ -369,6 +386,8 @@ function applyRulesOnServer() {
       canvasHeight: canvas.height,
       gravity: settings.gravity,
       viscosity: settings.viscosity,
+      chunkedThreads: settings.chunkedThreads,
+      particleSetSize: settings.particleSetSize,
     }),
   })
     .then((response) => {

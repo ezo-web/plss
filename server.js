@@ -168,10 +168,142 @@ function applyRulesOnServer(input) {
   };
 }
 
+function updateAtomAfterForces(input, atom, fx, fy) {
+  fy += input.gravity;
+
+  const vmix = 1 - input.viscosity;
+  let vx = atom[2] * vmix + fx * input.timeScale;
+  let vy = atom[3] * vmix + fy * input.timeScale;
+  let x = atom[0] + vx;
+  let y = atom[1] + vy;
+
+  if (x < 0) {
+    x = -x;
+    vx *= -1;
+  }
+  if (x >= input.canvasWidth) {
+    x = 2 * input.canvasWidth - x;
+    vx *= -1;
+  }
+  if (y < 0) {
+    y = -y;
+    vy *= -1;
+  }
+  if (y >= input.canvasHeight) {
+    y = 2 * input.canvasHeight - y;
+    vy *= -1;
+  }
+
+  return {
+    atom: [x, y, vx, vy, atom[4]],
+    totalV: Math.abs(vx) + Math.abs(vy),
+  };
+}
+
+function getSharedAtoms(input) {
+  if (!input.atomsBuffer) return null;
+
+  return {
+    values: new Float64Array(input.atomsBuffer),
+    length: input.atomCount,
+  };
+}
+
+function readSharedAtom(sharedAtoms, index) {
+  const offset = index * atomValueCount;
+  return [
+    sharedAtoms.values[offset],
+    sharedAtoms.values[offset + 1],
+    sharedAtoms.values[offset + 2],
+    sharedAtoms.values[offset + 3],
+    sharedAtoms.values[offset + 4],
+  ];
+}
+
+function applyRulesChunkOnServer(input) {
+  const sharedAtoms = getSharedAtoms(input);
+  const atomCount = sharedAtoms ? sharedAtoms.length : input.atoms.length;
+  const nextAtoms = new Array(input.chunkEnd - input.chunkStart);
+  let totalVSum = 0;
+
+  for (let i = input.chunkStart; i < input.chunkEnd; i++) {
+    const atom = sharedAtoms ? readSharedAtom(sharedAtoms, i) : input.atoms[i];
+    const ax = atom[0];
+    const ay = atom[1];
+    const color = atom[4];
+    const ruleRow = color * input.numColors;
+    const r2 = input.radii2Array[color];
+    let fx = 0;
+    let fy = 0;
+
+    for (let j = 0; j < atomCount; j++) {
+      const otherOffset = j * atomValueCount;
+      const bx = sharedAtoms
+        ? sharedAtoms.values[otherOffset]
+        : input.atoms[j][0];
+      const by = sharedAtoms
+        ? sharedAtoms.values[otherOffset + 1]
+        : input.atoms[j][1];
+      const otherColor = sharedAtoms
+        ? sharedAtoms.values[otherOffset + 4]
+        : input.atoms[j][4];
+      const dx = ax - bx;
+      const dy = ay - by;
+
+      if (dx !== 0 || dy !== 0) {
+        const d = dx * dx + dy * dy;
+        if (d < r2) {
+          const g = input.rulesArray[ruleRow + otherColor];
+          const f = g / Math.sqrt(d);
+          fx += f * dx;
+          fy += f * dy;
+        }
+      }
+    }
+
+    if (input.pulse !== 0) {
+      const dx = ax - input.pulseX;
+      const dy = ay - input.pulseY;
+      const d = dx * dx + dy * dy;
+      if (d > 0) {
+        const f = (100 * input.pulse) / (d * input.timeScale);
+        fx += f * dx;
+        fy += f * dy;
+      }
+    }
+
+    if (input.wallRepel > 0) {
+      const d = input.wallRepel;
+      const strength = 0.1;
+      if (ax < d) fx += (d - ax) * strength;
+      if (ax > input.canvasWidth - d) {
+        fx += (input.canvasWidth - d - ax) * strength;
+      }
+      if (ay < d) fy += (d - ay) * strength;
+      if (ay > input.canvasHeight - d) {
+        fy += (input.canvasHeight - d - ay) * strength;
+      }
+    }
+
+    const updated = updateAtomAfterForces(input, atom, fx, fy);
+    nextAtoms[i - input.chunkStart] = updated.atom;
+    totalVSum += updated.totalV;
+  }
+
+  return {
+    chunkStart: input.chunkStart,
+    atoms: nextAtoms,
+    totalVSum,
+  };
+}
+
 if (!isMainThread) {
   parentPort.on("message", ({ id, input }) => {
     try {
-      parentPort.postMessage({ id, result: applyRulesOnServer(input) });
+      const result = input.chunkedThreads
+        ? applyRulesChunkOnServer(input)
+        : applyRulesOnServer(input);
+      parentPort.postMessage({ id, result });
     } catch (error) {
       parentPort.postMessage({
         id,
@@ -204,6 +336,13 @@ class RuleWorkerPool {
     this.workers = Array.from({ length: size }, (_, index) =>
       this.createWorker(index),
     );
+  }
+
+  growTo(size) {
+    while (this.workers.length < size) {
+      this.workers.push(this.createWorker(this.workers.length));
+    }
+    this.size = this.workers.length;
   }
 
   createWorker(index) {
@@ -293,6 +432,95 @@ class RuleWorkerPool {
 
 const ruleWorkerPool = new RuleWorkerPool(getRuleWorkerCount());
 
+function createSharedAtoms(atoms) {
+  const atomsBuffer = new SharedArrayBuffer(
+    atoms.length * atomValueCount * Float64Array.BYTES_PER_ELEMENT,
+  );
+  const atomsF64 = new Float64Array(atomsBuffer);
+  let offset = 0;
+
+  for (const atom of atoms) {
+    atomsF64[offset] = atom[0];
+    atomsF64[offset + 1] = atom[1];
+    atomsF64[offset + 2] = atom[2];
+    atomsF64[offset + 3] = atom[3];
+    atomsF64[offset + 4] = atom[4];
+    offset += atomValueCount;
+  }
+
+  return atomsBuffer;
+}
+
+function getParticleSetSize(input) {
+  const particleSetSize = Math.floor(Number(input.particleSetSize));
+  return Number.isFinite(particleSetSize) && particleSetSize > 0
+    ? particleSetSize
+    : 100;
+}
+
+function applyRulesChunkedOnServer(input) {
+  const particleSetSize = getParticleSetSize(input);
+  const chunks = [];
+  const atomsBuffer = createSharedAtoms(input.atoms);
+  const sharedInput = {
+    ...input,
+    atoms: undefined,
+    atomsBuffer,
+    atomCount: input.atoms.length,
+  };
+
+  for (
+    let chunkStart = 0;
+    chunkStart < input.atoms.length;
+    chunkStart += particleSetSize
+  ) {
+    chunks.push({
+      ...sharedInput,
+      chunkedThreads: true,
+      chunkStart,
+      chunkEnd: Math.min(chunkStart + particleSetSize, input.atoms.length),
+    });
+  }
+
+  if (chunks.length === 0) {
+    return Promise.resolve({
+      atoms: [],
+      totalV: 0,
+    });
+  }
+
+  ruleWorkerPool.growTo(chunks.length);
+
+  return Promise.all(
+    chunks.map((chunkInput) => ruleWorkerPool.run(chunkInput)),
+  ).then((results) => {
+    const atoms = new Array(input.atoms.length);
+    let totalVSum = 0;
+
+    for (const result of results) {
+      totalVSum += result.totalVSum;
+      for (let i = 0; i < result.atoms.length; i++) {
+        atoms[result.chunkStart + i] = result.atoms[i];
+      }
+    }
+
+    return {
+      atoms,
+      totalV: totalVSum / input.atoms.length,
+      chunkCount: chunks.length,
+      workerCount: ruleWorkerPool.size,
+    };
+  });
+}
+
+function runRulesUpdate(input) {
+  if (input.chunkedThreads) {
+    return applyRulesChunkedOnServer(input);
+  }
+
+  return ruleWorkerPool.run(input);
+}
+
 function readJsonBody(request, callback) {
   let body = "";
 
@@ -324,8 +552,7 @@ const server = http.createServer((request, response) => {
         return;
       }
 
-      ruleWorkerPool
-        .run(input)
+      runRulesUpdate(input)
         .then((result) => {
           send(response, 200, JSON.stringify(result), {
             "Content-Type": "application/json; charset=utf-8",
