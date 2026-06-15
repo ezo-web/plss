@@ -1,6 +1,6 @@
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 8000);
@@ -11,10 +11,10 @@ const atomValueCount = 5;
 const atomByteStride = atomValueCount * Float64Array.BYTES_PER_ELEMENT;
 const maxRequestBytes = 20 * 1024 * 1024;
 const contentTypes = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.wasm': 'application/wasm',
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".wasm": "application/wasm",
 };
 
 const csp = [
@@ -24,25 +24,30 @@ const csp = [
   "connect-src 'self'",
   "img-src 'self' data: blob:",
   "media-src 'self' blob:",
-].join('; ');
+].join("; ");
 
-const wasmBytes = fs.readFileSync(path.join(root, 'life2d.wasm'));
-const wasmInstance = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {});
+const wasmBytes = fs.readFileSync(path.join(root, "life2d.wasm"));
+const wasmInstance = new WebAssembly.Instance(
+  new WebAssembly.Module(wasmBytes),
+  {},
+);
 const rulesWasm = wasmInstance.exports;
 let rulesWasmF64 = new Float64Array(rulesWasm.$.buffer);
 
 function send(response, statusCode, body, headers = {}) {
   response.writeHead(statusCode, {
-    'Content-Security-Policy': csp,
-    'X-Content-Type-Options': 'nosniff',
+    "Content-Security-Policy": csp,
+    "X-Content-Type-Options": "nosniff",
     ...headers,
   });
   response.end(body);
 }
 
 function resolveRequestPath(url) {
-  const pathname = decodeURIComponent(new URL(url, 'http://localhost').pathname);
-  const relativePath = pathname === '/' ? 'index.html' : pathname.slice(1);
+  const pathname = decodeURIComponent(
+    new URL(url, "http://localhost").pathname,
+  );
+  const relativePath = pathname === "/" ? "index.html" : pathname.slice(1);
   const filePath = path.resolve(root, relativePath);
 
   if (!filePath.startsWith(root + path.sep)) return null;
@@ -106,27 +111,45 @@ function applyRulesOnServer(input) {
   const atoms = input.atoms;
   const rulesArray = input.rulesArray;
   const radii2Array = input.radii2Array;
-  const layout = ensureRulesWasmLayout(atoms.length, rulesArray.length, radii2Array.length);
+  const layout = ensureRulesWasmLayout(
+    atoms.length,
+    rulesArray.length,
+    radii2Array.length,
+  );
 
   writeAtoms(atoms, layout.atomsIndex);
   rulesWasmF64.set(rulesArray, layout.rulesIndex);
   rulesWasmF64.set(radii2Array, layout.radii2Index);
 
   const result = rulesWasm.applyRulesWasm(
-    layout.atomsPtr, wasmNumberType,
-    atoms.length, wasmNumberType,
-    layout.rulesPtr, wasmNumberType,
-    layout.radii2Ptr, wasmNumberType,
-    input.numColors, wasmNumberType,
-    input.pulse, wasmNumberType,
-    input.pulseX, wasmNumberType,
-    input.pulseY, wasmNumberType,
-    input.timeScale, wasmNumberType,
-    input.wallRepel, wasmNumberType,
-    input.canvasWidth, wasmNumberType,
-    input.canvasHeight, wasmNumberType,
-    input.gravity, wasmNumberType,
-    input.viscosity, wasmNumberType
+    layout.atomsPtr,
+    wasmNumberType,
+    atoms.length,
+    wasmNumberType,
+    layout.rulesPtr,
+    wasmNumberType,
+    layout.radii2Ptr,
+    wasmNumberType,
+    input.numColors,
+    wasmNumberType,
+    input.pulse,
+    wasmNumberType,
+    input.pulseX,
+    wasmNumberType,
+    input.pulseY,
+    wasmNumberType,
+    input.timeScale,
+    wasmNumberType,
+    input.wallRepel,
+    wasmNumberType,
+    input.canvasWidth,
+    wasmNumberType,
+    input.canvasHeight,
+    wasmNumberType,
+    input.gravity,
+    wasmNumberType,
+    input.viscosity,
+    wasmNumberType,
   );
 
   return {
@@ -136,16 +159,16 @@ function applyRulesOnServer(input) {
 }
 
 function readJsonBody(request, callback) {
-  let body = '';
+  let body = "";
 
-  request.on('data', chunk => {
+  request.on("data", (chunk) => {
     body += chunk;
     if (body.length > maxRequestBytes) {
       request.destroy();
     }
   });
 
-  request.on('end', () => {
+  request.on("end", () => {
     try {
       callback(null, JSON.parse(body));
     } catch (error) {
@@ -153,28 +176,33 @@ function readJsonBody(request, callback) {
     }
   });
 
-  request.on('error', error => callback(error));
+  request.on("error", (error) => callback(error));
 }
 
 const server = http.createServer((request, response) => {
-  if (request.method === 'POST' && request.url === '/api/apply-rules') {
+  if (request.method === "POST" && request.url === "/api/apply-rules") {
     readJsonBody(request, (error, input) => {
       if (error) {
-        send(response, 400, JSON.stringify({ error: 'Invalid JSON body' }), {
-          'Content-Type': 'application/json; charset=utf-8',
+        send(response, 400, JSON.stringify({ error: "Invalid JSON body" }), {
+          "Content-Type": "application/json; charset=utf-8",
         });
         return;
       }
 
       try {
         send(response, 200, JSON.stringify(applyRulesOnServer(input)), {
-          'Content-Type': 'application/json; charset=utf-8',
+          "Content-Type": "application/json; charset=utf-8",
         });
       } catch (applyError) {
         console.error(applyError);
-        send(response, 500, JSON.stringify({ error: 'Failed to apply rules' }), {
-          'Content-Type': 'application/json; charset=utf-8',
-        });
+        send(
+          response,
+          500,
+          JSON.stringify({ error: "Failed to apply rules" }),
+          {
+            "Content-Type": "application/json; charset=utf-8",
+          },
+        );
       }
     });
     return;
@@ -182,18 +210,23 @@ const server = http.createServer((request, response) => {
 
   const filePath = resolveRequestPath(request.url);
   if (filePath === null) {
-    send(response, 403, 'Forbidden', { 'Content-Type': 'text/plain; charset=utf-8' });
+    send(response, 403, "Forbidden", {
+      "Content-Type": "text/plain; charset=utf-8",
+    });
     return;
   }
 
   fs.readFile(filePath, (error, data) => {
     if (error) {
-      send(response, 404, 'Not found', { 'Content-Type': 'text/plain; charset=utf-8' });
+      send(response, 404, "Not found", {
+        "Content-Type": "text/plain; charset=utf-8",
+      });
       return;
     }
 
-    const contentType = contentTypes[path.extname(filePath)] || 'application/octet-stream';
-    send(response, 200, data, { 'Content-Type': contentType });
+    const contentType =
+      contentTypes[path.extname(filePath)] || "application/octet-stream";
+    send(response, 200, data, { "Content-Type": contentType });
   });
 });
 
