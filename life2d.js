@@ -1,6 +1,7 @@
 const maxRadius = 200;
 const maxClusters = 50;
 const minClusterSize = 10;
+const minSmartParticleSetSize = 20;
 const predefinedColors = [
   "green",
   "red",
@@ -13,6 +14,14 @@ const predefinedColors = [
   "blue",
   "white",
   "lime",
+  "purple",
+  "pink",
+  "brown",
+  "coral",
+  "gold",
+  "silver",
+  "maroon",
+  "navy",
 ];
 const settings = {
   seed: 91651088029,
@@ -47,6 +56,7 @@ const settings = {
   explore: false,
   explorePeriod: 100,
   chunkedThreads: false,
+  smartChunking: false,
   particleSetSize: 100,
   rules: {},
   rulesArray: [],
@@ -115,6 +125,220 @@ Object.defineProperty(String.prototype, "capitalise", {
   enumerable: false,
 });
 
+const smartChunking = {
+  active: false,
+  settled: false,
+  phase: "idle",
+  candidates: [],
+  candidateIndex: 0,
+  searchRound: 0,
+  sampleCount: 0,
+  sampleTotal: 0,
+  bestFps: 0,
+  bestSize: 100,
+  lastCandidateSize: 100,
+  framesPerSample: 8,
+  maxSearchRounds: 3,
+  improvementRatio: 0.05, // require 5% improvement to keep a new candidate size
+};
+
+let smartChunkingController = null;
+let particleSetSizeController = null;
+
+function clampParticleSetSize(value) {
+  const maxSize = Math.max(1, atoms.length || settings.atoms.count);
+  return Math.min(maxSize, Math.max(1, Math.floor(value)));
+}
+
+function clampSmartParticleSetSize(value) {
+  const maxSize = Math.max(
+    minSmartParticleSetSize,
+    atoms.length || settings.atoms.count,
+  );
+  return Math.min(
+    maxSize,
+    Math.max(minSmartParticleSetSize, Math.floor(value)),
+  );
+}
+
+function setParticleSetSize(value) {
+  settings.particleSetSize = clampParticleSetSize(value);
+  if (particleSetSizeController) particleSetSizeController.updateDisplay();
+  invalidateServerStep();
+}
+
+function getSmartParticleSetMax() {
+  return Math.max(minSmartParticleSetSize, atoms.length || settings.atoms.count);
+}
+
+function uniqueSmartParticleSetSizes(sizes) {
+  const seen = new Set();
+  const values = [];
+
+  for (const size of sizes) {
+    const clampedSize = clampSmartParticleSetSize(size);
+    if (!seen.has(clampedSize)) {
+      seen.add(clampedSize);
+      values.push(clampedSize);
+    }
+  }
+
+  return values.sort((a, b) => a - b);
+}
+
+function getCoarseSmartChunkingCandidates() {
+  const maxSize = getSmartParticleSetMax();
+  const candidateCount = 12;
+  const sizes = [settings.particleSetSize, minSmartParticleSetSize, maxSize];
+
+  if (maxSize <= minSmartParticleSetSize) {
+    return uniqueSmartParticleSetSizes(sizes);
+  }
+
+  const ratio = maxSize / minSmartParticleSetSize;
+  for (let i = 0; i < candidateCount; i++) {
+    const t = i / (candidateCount - 1);
+    sizes.push(minSmartParticleSetSize * ratio ** t);
+  }
+
+  return uniqueSmartParticleSetSizes(sizes);
+}
+
+function getRefinedSmartChunkingCandidates() {
+  const maxSize = getSmartParticleSetMax();
+  const windowSize = Math.max(
+    1,
+    Math.round(smartChunking.bestSize / 2 ** smartChunking.searchRound),
+  );
+  const halfWindow = Math.max(1, Math.round(windowSize / 2));
+
+  return uniqueSmartParticleSetSizes([
+    smartChunking.bestSize - windowSize,
+    smartChunking.bestSize - halfWindow,
+    smartChunking.bestSize,
+    smartChunking.bestSize + halfWindow,
+    smartChunking.bestSize + windowSize,
+    minSmartParticleSetSize,
+    maxSize,
+  ]);
+}
+
+function startSmartChunkingCandidates(candidates, phase) {
+  smartChunking.candidates = candidates;
+  smartChunking.candidateIndex = 0;
+  smartChunking.phase = phase;
+  smartChunking.sampleCount = 0;
+  smartChunking.sampleTotal = 0;
+
+  if (smartChunking.candidates.length === 0) {
+    settleSmartChunking();
+    return;
+  }
+
+  smartChunking.lastCandidateSize = smartChunking.candidates[0];
+  setParticleSetSize(smartChunking.lastCandidateSize);
+}
+
+function updateChunkingControllers() {
+  if (!smartChunkingController) return;
+
+  if (settings.chunkedThreads) {
+    smartChunkingController.enable();
+  } else {
+    settings.smartChunking = false;
+    smartChunking.active = false;
+    smartChunking.settled = false;
+    smartChunking.phase = "idle";
+    smartChunkingController.disable();
+    smartChunkingController.updateDisplay();
+  }
+}
+
+function resetSmartChunking() {
+  smartChunking.active = settings.chunkedThreads && settings.smartChunking;
+  smartChunking.settled = false;
+  smartChunking.phase = smartChunking.active ? "coarse" : "idle";
+  smartChunking.candidates = [];
+  smartChunking.candidateIndex = 0;
+  smartChunking.searchRound = 0;
+  smartChunking.sampleCount = 0;
+  smartChunking.sampleTotal = 0;
+  smartChunking.bestFps = 0;
+  smartChunking.bestSize = smartChunking.active
+    ? clampSmartParticleSetSize(settings.particleSetSize)
+    : clampParticleSetSize(settings.particleSetSize);
+  smartChunking.lastCandidateSize = smartChunking.bestSize;
+  setParticleSetSize(smartChunking.bestSize);
+
+  if (smartChunking.active) {
+    startSmartChunkingCandidates(getCoarseSmartChunkingCandidates(), "coarse");
+  }
+}
+
+function sampleSmartChunking(fps) {
+  if (
+    !settings.chunkedThreads ||
+    !settings.smartChunking ||
+    !smartChunking.active ||
+    smartChunking.settled ||
+    !Number.isFinite(fps) ||
+    fps <= 0
+  ) {
+    return null;
+  }
+
+  smartChunking.sampleCount += 1;
+  smartChunking.sampleTotal += fps;
+
+  if (smartChunking.sampleCount < smartChunking.framesPerSample) return null;
+
+  const averageFps = smartChunking.sampleTotal / smartChunking.sampleCount;
+  smartChunking.sampleCount = 0;
+  smartChunking.sampleTotal = 0;
+
+  return averageFps;
+}
+
+function smartChunkingImproved(fps) {
+  return fps > smartChunking.bestFps * (1 + smartChunking.improvementRatio);
+}
+
+function settleSmartChunking() {
+  smartChunking.active = false;
+  smartChunking.settled = true;
+  smartChunking.phase = "settled";
+  setParticleSetSize(smartChunking.bestSize);
+}
+
+function updateSmartChunking(fps) {
+  const averageFps = sampleSmartChunking(fps);
+  if (averageFps === null) return;
+
+  if (smartChunkingImproved(averageFps)) {
+    smartChunking.bestFps = averageFps;
+    smartChunking.bestSize = smartChunking.lastCandidateSize;
+  }
+
+  smartChunking.candidateIndex += 1;
+  if (smartChunking.candidateIndex < smartChunking.candidates.length) {
+    smartChunking.lastCandidateSize =
+      smartChunking.candidates[smartChunking.candidateIndex];
+    setParticleSetSize(smartChunking.lastCandidateSize);
+    return;
+  }
+
+  smartChunking.searchRound += 1;
+  if (smartChunking.searchRound >= smartChunking.maxSearchRounds) {
+    settleSmartChunking();
+    return;
+  }
+
+  startSmartChunkingCandidates(
+    getRefinedSmartChunkingCandidates(),
+    "refine",
+  );
+}
+
 // Build GUI
 const setupGUI = () => {
   settings.gui = new lil.GUI();
@@ -124,12 +348,13 @@ const setupGUI = () => {
   configFolder.add(settings, "randomRules").name("Random Rules");
   configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
   configFolder
-    .add(settings, "numColors", 1, 11, 1)
+    .add(settings, "numColors", 1, 19, 1)
     .name("Number of Colors")
     .listen()
     .onFinishChange((v) => {
       setNumberOfColors();
       startRandom();
+      resetSmartChunking();
     });
   configFolder
     .add(settings, "seed")
@@ -138,13 +363,14 @@ const setupGUI = () => {
     .onFinishChange((v) => {
       startRandom();
     });
-  configFolder.add(settings, "fps").name("FPS - (Live)").listen().disable();
+  configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
   configFolder
-    .add(settings.atoms, "count", 1, 1000, 1)
+    .add(settings.atoms, "count", 1, 3000, 1)
     .name("Atoms per-color")
     .listen()
     .onFinishChange((v) => {
       randomAtoms(v, true);
+      resetSmartChunking();
     });
   configFolder
     .add(settings, "time_scale", 0.1, 5, 0.01)
@@ -175,16 +401,26 @@ const setupGUI = () => {
     .name("Chunked Threads")
     .listen()
     .onFinishChange(() => {
+      updateChunkingControllers();
+      resetSmartChunking();
       invalidateServerStep();
     });
-  configFolder
-    .add(settings, "particleSetSize", 20, 1000, 20)
+  smartChunkingController = configFolder
+    .add(settings, "smartChunking")
+    .name("Smart Chunking")
+    .listen()
+    .onFinishChange(() => {
+      resetSmartChunking();
+      invalidateServerStep();
+    });
+  particleSetSizeController = configFolder
+    .add(settings, "particleSetSize", 20, 4000, 20)
     .name("Particles per Thread")
     .listen()
     .onFinishChange((v) => {
-      settings.particleSetSize = Math.max(1, Math.floor(v));
-      invalidateServerStep();
+      setParticleSetSize(v);
     });
+  updateChunkingControllers();
   // Drawings
   const drawingsFolder = settings.gui.addFolder("Drawings");
   drawingsFolder
@@ -398,7 +634,9 @@ function applyRulesOnServer() {
     .then((result) => {
       if (requestVersion !== simulationVersion) return;
       total_v = result.totalV;
+      if (Number.isFinite(result.fps)) settings.fps = result.fps;
       syncServerAtoms(result.atoms);
+      updateSmartChunking(result.fps);
     })
     .catch((error) => {
       serverStepFailed = true;
@@ -586,8 +824,6 @@ setupGUI();
 
 console.log("settings", settings);
 
-// Update Frames
-var lastT = Date.now();
 update();
 
 function update() {
@@ -621,14 +857,6 @@ function update() {
 
 // post-frame stats and updates
 function updateParams() {
-  // record FPS
-  var curT = Date.now();
-  if (curT > lastT) {
-    const new_fps = 1000 / (curT - lastT);
-    settings.fps = Math.round(settings.fps * 0.8 + new_fps * 0.2);
-    lastT = curT;
-  }
-
   // adapt time_scale based on activity
   if (total_v > 30 && settings.time_scale > 5) settings.time_scale /= 1.1;
   if (settings.time_scale < 0.9) settings.time_scale *= 1.01;

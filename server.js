@@ -8,6 +8,7 @@ const {
   parentPort,
   workerData,
 } = require("node:worker_threads");
+const { performance } = require("node:perf_hooks");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 8000);
@@ -20,6 +21,7 @@ const wasmScratchOffset = 4096;
 const atomValueCount = 5;
 const atomByteStride = atomValueCount * Float64Array.BYTES_PER_ELEMENT;
 const maxRequestBytes = 20 * 1024 * 1024;
+let smoothedServerFps = 0;
 const contentTypes = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -48,6 +50,9 @@ function send(response, statusCode, body, headers = {}) {
   response.writeHead(statusCode, {
     "Content-Security-Policy": csp,
     "X-Content-Type-Options": "nosniff",
+    "Connection": "keep-alive",
+    "Keep-Alive": "timeout=5, max=100",
+    "Cache-Control": "max-age=1",
     ...headers,
   });
   response.end(body);
@@ -521,6 +526,18 @@ function runRulesUpdate(input) {
   return ruleWorkerPool.run(input);
 }
 
+function recordServerFps(frameDurationMs) {
+  if (frameDurationMs <= 0) return Math.round(smoothedServerFps);
+
+  const frameFps = 1000 / frameDurationMs;
+  smoothedServerFps =
+    smoothedServerFps === 0
+      ? frameFps
+      : smoothedServerFps * 0.8 + frameFps * 0.2;
+
+  return Math.round(smoothedServerFps);
+}
+
 function readJsonBody(request, callback) {
   let body = "";
 
@@ -552,9 +569,12 @@ const server = http.createServer((request, response) => {
         return;
       }
 
+      const frameStartTime = performance.now();
+
       runRulesUpdate(input)
         .then((result) => {
-          send(response, 200, JSON.stringify(result), {
+          const fps = recordServerFps(performance.now() - frameStartTime);
+          send(response, 200, JSON.stringify({ ...result, fps }), {
             "Content-Type": "application/json; charset=utf-8",
           });
         })
