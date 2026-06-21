@@ -57,7 +57,7 @@ const settings = {
   explorePeriod: 100,
   chunkedThreads: false,
   smartChunking: false,
-  particleSetSize: 100,
+  particleSetSize: 50,
   rules: {},
   rulesArray: [],
   radii: {},
@@ -138,8 +138,8 @@ const smartChunking = {
   bestSize: 100,
   lastCandidateSize: 100,
   framesPerSample: 8,
-  maxSearchRounds: 3,
-  improvementRatio: 0.05, // require 5% improvement to keep a new candidate size
+  maxSearchRounds: 7,
+  improvementRatio: 0.02, // require 10% improvement to keep a new candidate size
 };
 
 let smartChunkingController = null;
@@ -414,7 +414,7 @@ const setupGUI = () => {
       invalidateServerStep();
     });
   particleSetSizeController = configFolder
-    .add(settings, "particleSetSize", 20, 4000, 20)
+    .add(settings, "particleSetSize", 20, 4000, 5)
     .name("Particles per Thread")
     .listen()
     .onFinishChange((v) => {

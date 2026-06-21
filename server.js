@@ -12,6 +12,7 @@ const { performance } = require("node:perf_hooks");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 8000);
+const HOST = process.env.HOST || "0.0.0.0";
 const wasmPath = isMainThread
   ? path.join(root, "life2d.wasm")
   : workerData.wasmPath;
@@ -615,7 +616,7 @@ const server = http.createServer((request, response) => {
   });
 });
 
-server.listen(port, () => {
+server.listen(port, HOST, () => {
   console.log(
     `Serving Life on port ${port} with ${ruleWorkerPool.size} rule workers`,
   );
