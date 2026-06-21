@@ -1,0 +1,60 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  --canvas-bg-color: rgba(0, 0, 0, 0); /* transparent */
+}
+button {
+  color: #ffffff;
+  border: 2px dashed #504e52;
+  padding: 10px 20px;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.spinner {
+  width: 50px;
+  height: 50px;
+  border: 5px solid #f3f3f3; /* Light gray background circle */
+  border-top: 5px solid #3498db; /* Blue rotating accent */
+  border-radius: 50%; /* Transforms the square into a circle */
+  animation: revealEffect 1s ease-in forwards, spin 1s linear infinite, exitEffect 1s ease-out 3s forwards; /* Smooth, endless rotation */
+}
+
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.fade-in-out {
+  /* Apply custom animation: name, duration, timing, delay, fill-mode */
+  animation: revealEffect 1s ease-in forwards, exitEffect 1s ease-out 3s forwards;
+
+  /* Start completely invisible and unclickable */
+  opacity: 0;
+  visibility: hidden;
+}
+
+.fade-in {
+  animation: revealEffect 1s ease-in forwards;
+  opacity: 0;
+  visibility: hidden;
+}
+
+@keyframes exitEffect {
+  to {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+
+@keyframes revealEffect {
+  to {
+    opacity: 1;
+    visibility: visible;
+  }
+}

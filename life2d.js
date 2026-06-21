@@ -69,6 +69,12 @@ const settings = {
   gravity: 0.0, // pulling downward
   pulseDuration: 10,
   wallRepel: 40,
+  shutdown: () => {
+      settings.gui.domElement.style.opacity = '0';
+      setTimeout(() => {
+      window.location.href = 'shutdown.html';
+    }, 500); // match the CSS transition duration
+  },
   reset: () => {
     randomAtoms(settings.atoms.count, true);
   },
@@ -342,8 +348,13 @@ function updateSmartChunking(fps) {
 // Build GUI
 const setupGUI = () => {
   settings.gui = new lil.GUI();
+
+  settings.gui.domElement.style.opacity = '0';
+  settings.gui.domElement.style.transition = 'opacity 0.5s ease-in-out';
+
   // Configs
   const configFolder = settings.gui.addFolder("Config");
+  configFolder.add(settings, "shutdown").name("Shutdown").listen();
   configFolder.add(settings, "reset").name("Reset");
   configFolder.add(settings, "randomRules").name("Random Rules");
   configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
@@ -463,6 +474,10 @@ const setupGUI = () => {
         flattenRules();
       });
   }
+  requestAnimationFrame(() => {
+  settings.gui.domElement.style.opacity = '1';
+  canv.style.opacity = '1';
+});
 };
 
 // Seedable 'decent' random generator
@@ -488,7 +503,6 @@ function loadSeedFromUrl() {
 function randomRules() {
   if (!isFinite(settings.seed)) settings.seed = 0xcafecafe;
   window.location.hash = "#" + settings.seed;
-  document.title = "Life #" + settings.seed;
   local_seed = settings.seed;
   console.log("Seed=" + local_seed);
   for (const i of settings.colors) {
@@ -905,3 +919,5 @@ mediaRecorder.onstop = function (e) {
 // mediaRecorder.start(); // Start recording
 // mediaRecorder.stop(); // Stop recording
 // --------------------------------------------------
+
+document.title = "PLSS - ONLINE";

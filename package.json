@@ -1,5 +1,34 @@
 {
+  "name": "PLSS",
+  "version": "1.0.0",
+  "description": "Performance Life Simulator System",
+  "keywords": [
+    "simulation"
+  ],
+  "homepage": "https://github.com/ezo-web/plss#readme",
+  "bugs": {
+    "url": "https://github.com/ezo-web/plss/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ezo-web/plss.git"
+  },
+  "license": "CC-BY-NC-ND-4.0",
+  "author": "ezo-web",
+  "type": "commonjs",
+  "main": "main.js",
   "scripts": {
-    "start": "bun run server.js"
+    "start": "bun run server.js",
+    "elec": "electron ."
+  },
+  "dependencies": {
+    "readline": "^1.3.0",
+    "readline-sync": "^1.4.10"
+  },
+  "devDependencies": {
+    "@electron/fuses": "^1.8.0",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "electron-reloader": "^1.2.3"
   }
 }

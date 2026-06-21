@@ -51,7 +51,7 @@ function send(response, statusCode, body, headers = {}) {
   response.writeHead(statusCode, {
     "Content-Security-Policy": csp,
     "X-Content-Type-Options": "nosniff",
-    "Connection": "keep-alive",
+    Connection: "keep-alive",
     "Keep-Alive": "timeout=5, max=100",
     "Cache-Control": "max-age=1",
     ...headers,
@@ -560,36 +560,51 @@ function readJsonBody(request, callback) {
   request.on("error", (error) => callback(error));
 }
 
+var online = false;
+
 const server = http.createServer((request, response) => {
-  if (request.method === "POST" && request.url === "/api/apply-rules") {
-    readJsonBody(request, (error, input) => {
-      if (error) {
-        send(response, 400, JSON.stringify({ error: "Invalid JSON body" }), {
-          "Content-Type": "application/json; charset=utf-8",
-        });
-        return;
-      }
-
-      const frameStartTime = performance.now();
-
-      runRulesUpdate(input)
-        .then((result) => {
-          const fps = recordServerFps(performance.now() - frameStartTime);
-          send(response, 200, JSON.stringify({ ...result, fps }), {
+  if (online) {
+    if (request.method === "POST" && request.url === "/api/apply-rules") {
+      readJsonBody(request, (error, input) => {
+        if (error) {
+          send(response, 400, JSON.stringify({ error: "Invalid JSON body" }), {
             "Content-Type": "application/json; charset=utf-8",
           });
-        })
-        .catch((applyError) => {
-          console.error(applyError);
-          send(
-            response,
-            500,
-            JSON.stringify({ error: "Failed to apply rules" }),
-            {
+          return;
+        }
+
+        const frameStartTime = performance.now();
+
+        runRulesUpdate(input)
+          .then((result) => {
+            const fps = recordServerFps(performance.now() - frameStartTime);
+            send(response, 200, JSON.stringify({ ...result, fps }), {
               "Content-Type": "application/json; charset=utf-8",
-            },
-          );
-        });
+            });
+          })
+          .catch((applyError) => {
+            console.error(applyError);
+            send(
+              response,
+              500,
+              JSON.stringify({ error: "Failed to apply rules" }),
+              {
+                "Content-Type": "application/json; charset=utf-8",
+              },
+            );
+          });
+      });
+      return;
+    }
+  }
+
+  if (request.method === "POST" && request.url === "/shutdown") {
+    online = false;
+  }
+  if (request.method === "POST" && request.url === "/startup") {
+    online = true;
+    send(response, 200, JSON.stringify({ success: true }), {
+      "Content-Type": "application/json; charset=utf-8",
     });
     return;
   }
