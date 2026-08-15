@@ -83,7 +83,7 @@ async function initWebGPU() {
             return;
         }
 
-        console.log('Using WebGPU package:', loadedPackageName);
+        // console.log('Using WebGPU package:', loadedPackageName);
         // Some packages export navigator.gpu-like API under .gpu
         const gpuAPI = nodeGpu.gpu || nodeGpu;
 
@@ -937,7 +937,7 @@ async function runRulesUpdate(input) {
     const t0 = performance.now();
     const cpuResult = await applyRulesChunkedOnServer(input);
     const t1 = performance.now();
-    console.log(`CPU time: ${(t1 - t0).toFixed(2)}ms`);
+    // console.log(`CPU time: ${(t1 - t0).toFixed(2)}ms`);
     return cpuResult;
 }
 
@@ -1086,6 +1086,6 @@ setInterval(async () => {
 
     const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
 
-    process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | FPS: ${serverFps} |`);
+    process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} |`);
     cpuUsageLog.push(Number(cpuUsagePercentage))
 }, 1000);

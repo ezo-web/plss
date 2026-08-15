@@ -1,7 +1,6 @@
 const maxRadius = 200;
 const maxRadiusSquared = maxRadius * maxRadius;
 const maxClusters = 50;
-const { performance, PerformanceObserver } = require('node:perf_hooks');
 const minClusterSize = 10;
 const minSmartParticleSetSize = 20;
 const predefinedColors = [
@@ -25,22 +24,11 @@ const predefinedColors = [
     "maroon",
     "navy",
 ];
-let smoothedServerFps = 0;
-function recordServerFps(frameDurationMs) {
-    if (frameDurationMs <= 0) return Math.round(smoothedServerFps);
-
-    const frameFps = 1000 / frameDurationMs;
-    smoothedServerFps =
-        smoothedServerFps === 0
-            ? frameFps
-            : smoothedServerFps * 0.8 + frameFps * 0.2;
-
-    return Math.round(smoothedServerFps);
-}
 const settings = {
     seed: 91651088029,
     fps: 0,
     clientFps: 0,
+    framesThisSecond: 0,
     atomCount: 0,
     atoms: {
         count: 500, // Per Color
@@ -389,6 +377,7 @@ const setupGUI = () => {
     }
     configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
     configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
+    configFolder.add(settings, "framesThisSecond").name("Frames This Seconds").listen().disable();
     configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
     configFolder
         .add(settings.atoms, "count", 1, 3000, 1)
@@ -407,7 +396,7 @@ const setupGUI = () => {
         .name("Manual Frame Rate")
         .listen();
     configFolder
-        .add(settings, "time_scale", 0.01, 5, 0.01)
+        .add(settings, "time_scale", 0.01, 10, 0.01)
         .name("Time Scale")
         .listen();
     configFolder
@@ -681,9 +670,10 @@ function applyRulesOnServer() {
             .then((result) => {
                 if (requestVersion !== simulationVersion) return;
                 total_v = result.totalV;
-                settings.fps = recordServerFps(performance.now() - result.frameStartTime);
+                settings.fps = result.fps;
                 settings.atomCount = result.atoms.length;
                 syncServerAtoms(result.atoms);
+                settings.framesThisSecond += 1
                 updateSmartChunking(result.fps);
             })
             .catch((error) => {
@@ -923,7 +913,7 @@ function update() {
     if (!settings.manual_frame_rate) {
         applyRules();
     } else {
-        if (settings.time_scale >= 1) {
+        if (settings.time_scale > 1) {
             // Request multiple frames for acceleration (sequentially)
             const frameCount = Math.round(settings.time_scale);
             for (let i = 0; i < frameCount; i++) {
@@ -1023,3 +1013,7 @@ mediaRecorder.onstop = function (e) {
 // mediaRecorder.start(); // Start recording
 // mediaRecorder.stop(); // Stop recording
 // --------------------------------------------------
+
+setInterval(() => {
+    settings.framesThisSecond = 0
+}, 1000)
