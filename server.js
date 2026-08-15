@@ -4,6 +4,7 @@ const os = require("node:os");
 const path = require("node:path");
 const readline = require('readline');
 const cpuUsageLog = [0.00]
+var serverFps
 const {
     Worker,
     isMainThread,
@@ -13,8 +14,7 @@ const {
 const {performance} = require("node:perf_hooks");
 
 const root = __dirname;
-const port = Number(process.env.PORT || 8000);
-const monitorPort = Number(process.env.MONITOR_PORT || 8001);
+const port = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 const cpuDetails = os.cpus();
 const deviceCores = cpuDetails.length;
@@ -46,13 +46,268 @@ const csp = [
     "media-src 'self' blob:",
 ].join("; ");
 
-const wasmBytes = fs.readFileSync(wasmPath);
-const wasmInstance = new WebAssembly.Instance(
-    new WebAssembly.Module(wasmBytes),
-    {},
-);
-const rulesWasm = wasmInstance.exports;
-let rulesWasmF64 = new Float64Array(rulesWasm.$.buffer);
+const wasmBytes = fs.existsSync(wasmPath) ? fs.readFileSync(wasmPath) : null;
+let wasmInstance = null;
+let rulesWasm = null;
+let rulesWasmF64 = null;
+if (wasmBytes) {
+    wasmInstance = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {});
+    rulesWasm = wasmInstance.exports;
+    rulesWasmF64 = new Float64Array(rulesWasm.$.buffer);
+}
+
+// Attempt to initialize WebGPU on the server (node). Prefer @webgpu/wgpu but fall back gracefully.
+let gpuAvailable = false;
+let gpuDevice = null;
+let gpuAdapter = null;
+let gpuBackend = null;
+
+async function initWebGPU() {
+    try {
+        // Try common Node WebGPU packages
+        let nodeGpu = null;
+        try {
+            nodeGpu = require('@webgpu/wgpu');
+        } catch (e) {
+            try {
+                nodeGpu = require('node-webgpu');
+            } catch (e2) {
+                nodeGpu = null;
+            }
+        }
+
+        if (!nodeGpu) {
+            console.warn('No Node WebGPU package found; GPU path disabled. Install @webgpu/wgpu for WebGPU support.');
+            return;
+        }
+
+        // Some packages export navigator.gpu-like API under .gpu
+        const gpuAPI = nodeGpu.gpu || nodeGpu;
+
+        // requestAdapter / requestDevice are async in the modern API
+        if (typeof gpuAPI.requestAdapter === 'function') {
+            gpuAdapter = await gpuAPI.requestAdapter();
+            gpuDevice = await gpuAdapter.requestDevice();
+        } else if (typeof gpuAPI.requestDevice === 'function') {
+            // some bindings expose direct device creation
+            gpuDevice = await gpuAPI.requestDevice();
+        } else if (typeof nodeGpu.requestAdapter === 'function') {
+            gpuAdapter = await nodeGpu.requestAdapter();
+            gpuDevice = await gpuAdapter.requestDevice();
+        }
+
+        if (gpuDevice) {
+            gpuAvailable = true;
+            gpuBackend = nodeGpu;
+            console.log('WebGPU initialized for server-side rule computation.');
+        }
+    } catch (err) {
+        console.warn('WebGPU initialization failed, falling back to WASM/CPU path:', err && err.message ? err.message : err);
+    }
+}
+
+// Kick off initialization but don't block startup; runRulesUpdate will wait if needed
+initWebGPU();
+
+// applyRulesOnGPU: attempts to compute the same rules using a WebGPU compute shader.
+// Note: The WGSL shader uses f32 arithmetic; inputs are converted to f32 and outputs are converted back to JS numbers.
+async function applyRulesOnGPU(input) {
+    if (!gpuAvailable || !gpuDevice) throw new Error('WebGPU device not available');
+
+    const atomCount = input.atoms.length;
+    if (atomCount === 0) return {atoms: [], totalV: 0};
+
+    // Convert inputs to Float32 arrays for GPU
+    const atomsF32 = new Float32Array(atomCount * atomValueCount);
+    for (let i = 0; i < atomCount; i++) {
+        const a = input.atoms[i];
+        const off = i * atomValueCount;
+        atomsF32[off] = a[0];
+        atomsF32[off + 1] = a[1];
+        atomsF32[off + 2] = a[2];
+        atomsF32[off + 3] = a[3];
+        atomsF32[off + 4] = a[4];
+    }
+
+    const rulesF32 = new Float32Array(input.rulesArray.map((v) => v));
+    const radiiF32 = new Float32Array(input.radii2Array.map((v) => v));
+
+    // Build WGSL compute shader implementing the same physics loop.
+    const shaderWGSL = `
+struct Atom { x: f32; y: f32; vx: f32; vy: f32; color: f32; };
+@group(0) @binding(0) var<storage, read> atoms_in: array<Atom>;
+@group(0) @binding(1) var<storage, read_write> atoms_out: array<Atom>;
+@group(0) @binding(2) var<storage, read> rules: array<f32>;
+@group(0) @binding(3) var<storage, read> radii2: array<f32>;
+@group(0) @binding(4) var<uniform> params: array<f32>;
+
+// params layout (indexes)
+// 0: atomCount, 1: numColors, 2: forceScale, 3: pulse, 4: pulseX, 5: pulseY, 6: wallRepel, 7: canvasWidth, 8: canvasHeight, 9: gravity, 10: viscosity
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
+    let i = i32(GlobalId.x);
+    let count = i32(params[0]);
+    if (i >= count) { return; }
+
+    let ax = atoms_in[i].x;
+    let ay = atoms_in[i].y;
+    var avx = atoms_in[i].vx;
+    var avy = atoms_in[i].vy;
+    let color = i32(atoms_in[i].color);
+    let numColors = i32(params[1]);
+    let ruleRow = color * numColors;
+    let r2 = radii2[color];
+    var fx: f32 = 0.0;
+    var fy: f32 = 0.0;
+
+    // loop over other atoms
+    var j: i32 = 0;
+    for (; j < count; j = j + 1) {
+        if (j == i) { continue; }
+        let bx = atoms_in[j].x;
+        let by = atoms_in[j].y;
+        let dx = ax - bx;
+        let dy = ay - by;
+        if (dx == 0.0 && dy == 0.0) { continue; }
+        let d = dx * dx + dy * dy;
+        if (d < r2 && d > 0.0) {
+            let otherColor = i32(atoms_in[j].color);
+            let g = rules[f32(ruleRow + otherColor)];
+            let inv = 1.0 / sqrt(d);
+            let f = g * inv;
+            fx = fx + f * dx;
+            fy = fy + f * dy;
+        }
+    }
+
+    let pulse = params[3];
+    if (pulse != 0.0) {
+        let dx = ax - params[4];
+        let dy = ay - params[5];
+        let d = dx * dx + dy * dy;
+        if (d > 0.0) {
+            let f = (100.0 * pulse) / (d * params[2]);
+            fx = fx + f * dx;
+            fy = fy + f * dy;
+        }
+    }
+
+    let wallRepel = params[6];
+    if (wallRepel > 0.0) {
+        let d = wallRepel;
+        let strength = 0.1;
+        if (ax < d) { fx = fx + (d - ax) * strength; }
+        if (ax > params[7] - d) { fx = fx + (params[7] - d - ax) * strength; }
+        if (ay < d) { fy = fy + (d - ay) * strength; }
+        if (ay > params[8] - d) { fy = fy + (params[8] - d - ay) * strength; }
+    }
+
+    // update
+    var fy_total = fy + params[9];
+    let vmix = 1.0 - params[10];
+    var vx = avx * vmix + fx * params[2];
+    var vy = avy * vmix + fy_total * params[2];
+    var x = ax + vx;
+    var y = ay + vy;
+
+    if (x < 0.0) { x = -x; vx = -vx; }
+    if (x >= params[7]) { x = 2.0 * params[7] - x; vx = -vx; }
+    if (y < 0.0) { y = -y; vy = -vy; }
+    if (y >= params[8]) { y = 2.0 * params[8] - y; vy = -vy; }
+
+    atoms_out[i].x = x;
+    atoms_out[i].y = y;
+    atoms_out[i].vx = vx;
+    atoms_out[i].vy = vy;
+    atoms_out[i].color = atoms_in[i].color;
+}
+`;
+
+    // Create GPU resources
+    const device = gpuDevice;
+    const shaderModule = device.createShaderModule({code: shaderWGSL});
+    const pipeline = device.createComputePipeline({compute: {module: shaderModule, entryPoint: 'main'}});
+
+    // Create buffers (GPUBuffer usage flags vary by binding)
+    const atomsInBuf = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+    const atomsOutBuf = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+    const rulesBuf = device.createBuffer({size: rulesF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+    const radiiBuf = device.createBuffer({size: radiiF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+
+    // Uniforms: small float32 array
+    const paramsArray = new Float32Array([
+        atomCount,
+        input.numColors,
+        input.forceScale,
+        input.pulse,
+        input.pulseX,
+        input.pulseY,
+        input.wallRepel,
+        input.canvasWidth,
+        input.canvasHeight,
+        input.gravity,
+        input.viscosity,
+    ]);
+    const paramsBuf = device.createBuffer({size: paramsArray.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+
+    // Upload data
+    device.queue.writeBuffer(atomsInBuf, 0, atomsF32.buffer, atomsF32.byteOffset, atomsF32.byteLength);
+    device.queue.writeBuffer(rulesBuf, 0, rulesF32.buffer, rulesF32.byteOffset, rulesF32.byteLength);
+    device.queue.writeBuffer(radiiBuf, 0, radiiF32.buffer, radiiF32.byteOffset, radiiF32.byteLength);
+    device.queue.writeBuffer(paramsBuf, 0, paramsArray.buffer, paramsArray.byteOffset, paramsArray.byteLength);
+
+    // Bind group
+    const bindGroup = device.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+            {binding: 0, resource: {buffer: atomsInBuf}},
+            {binding: 1, resource: {buffer: atomsOutBuf}},
+            {binding: 2, resource: {buffer: rulesBuf}},
+            {binding: 3, resource: {buffer: radiiBuf}},
+            {binding: 4, resource: {buffer: paramsBuf}},
+        ],
+    });
+
+    // Encode commands
+    const commandEncoder = device.createCommandEncoder();
+    const pass = commandEncoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    const workgroupSize = 64;
+    const numGroups = Math.ceil(atomCount / workgroupSize);
+    pass.dispatchWorkgroups(numGroups);
+    pass.end();
+
+    // Copy output to a mappable buffer
+    const readback = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+    commandEncoder.copyBufferToBuffer(atomsOutBuf, 0, readback, 0, atomsF32.byteLength);
+
+    device.queue.submit([commandEncoder.finish()]);
+
+    // Map and read results
+    await readback.mapAsync(0, 0, atomsF32.byteLength);
+    const mapped = readback.getMappedRange();
+    const resultF32 = new Float32Array(mapped.slice(0));
+    readback.unmap();
+
+    // Convert back to JS array of arrays and compute totalV as average of (abs vx + abs vy)
+    const atomsOut = new Array(atomCount);
+    let totalVSum = 0;
+    for (let i = 0; i < atomCount; i++) {
+        const off = i * atomValueCount;
+        const x = resultF32[off];
+        const y = resultF32[off + 1];
+        const vx = resultF32[off + 2];
+        const vy = resultF32[off + 3];
+        const c = Math.floor(resultF32[off + 4]);
+        atomsOut[i] = [x, y, vx, vy, c];
+        totalVSum += Math.abs(vx) + Math.abs(vy);
+    }
+
+    return {atoms: atomsOut, totalV: totalVSum / atomCount};
+}
+
 
 function send(response, statusCode, body, headers = {}) {
     response.writeHead(statusCode, {
@@ -161,7 +416,7 @@ function applyRulesOnServer(input) {
         wasmNumberType,
         input.pulseY,
         wasmNumberType,
-        input.timeScale,
+        input.forceScale,
         wasmNumberType,
         input.wallRepel,
         wasmNumberType,
@@ -185,8 +440,8 @@ function updateAtomAfterForces(input, atom, fx, fy) {
     fy += input.gravity;
 
     const vmix = 1 - input.viscosity;
-    let vx = atom[2] * vmix + fx * input.timeScale;
-    let vy = atom[3] * vmix + fy * input.timeScale;
+    let vx = atom[2] * vmix + fx * input.forceScale;
+    let vy = atom[3] * vmix + fy * input.forceScale;
     let x = atom[0] + vx;
     let y = atom[1] + vy;
 
@@ -259,7 +514,7 @@ function applyRulesChunkOnServer(input) {
     const numColors = input.numColors;
     const canvasWidth = input.canvasWidth;
     const canvasHeight = input.canvasHeight;
-    const timeScale = input.timeScale;
+    const forceScale = input.forceScale;
     const pulse = input.pulse;
     const pulseX = input.pulseX;
     const pulseY = input.pulseY;
@@ -309,7 +564,7 @@ function applyRulesChunkOnServer(input) {
             const dy = ay - pulseY;
             const d = dx * dx + dy * dy;
             if (d > 0) {
-                const f = (100 * pulse) / (d * timeScale);
+                const f = (100 * pulse) / (d * forceScale);
                 fx += f * dx;
                 fy += f * dy;
             }
@@ -620,7 +875,17 @@ function applyRulesChunkedOnServer(input) {
     });
 }
 
-function runRulesUpdate(input) {
+async function runRulesUpdate(input) {
+    if (gpuAvailable && gpuDevice) {
+        try {
+            // GPU path produces same structure as CPU path: { atoms, totalV }
+            return await applyRulesOnGPU(input);
+        } catch (err) {
+            console.error('WebGPU computation failed, falling back to CPU worker pool:', err && err.message ? err.message : err);
+        }
+    }
+
+    // Fallback: existing chunked CPU/worker implementation
     return applyRulesChunkedOnServer(input);
 }
 
@@ -672,7 +937,8 @@ const server = http.createServer((request, response) => {
             runRulesUpdate(input)
                 .then((result) => {
                     const fps = recordServerFps(performance.now() - frameStartTime);
-                    send(response, 200, JSON.stringify({...result, fps}), {
+                    serverFps = fps;
+                    send(response, 200, JSON.stringify({...result, fps, frameStartTime}), {
                         "Content-Type": "application/json; charset=utf-8",
                     });
                 })
@@ -719,10 +985,10 @@ server.listen(port, HOST, () => {
         startMessage = `[WARNING] YOUR DEVICE DOES NOT MEET THE RECOMMENDED HARDWARE REQUIREMENTS TO RUN PLSS. PROCEED WITH CAUTION AND DO NOT USE MORE THAN 4500 PARTICLES IN YOUR SIMULATION.`
     }
     if (Number(deviceCores) >= 8) {
-        startMessage = `| Serving PLSS on http://localhost:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism is disabled as your devices does not meet the minimum requirements to use the feature\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism is disabled as your devices does not meet the minimum requirements to use the feature\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
     }
     if (Number(deviceCores) >= 10) {
-        startMessage = `| Serving PLSS on http://localhost:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism may cause lag spikes while evaluating, this is normal and should stop after it's done\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism may cause lag spikes while evaluating, this is normal and should stop after it's done\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
     }
 
     console.log(`${startMessage}`);
@@ -768,6 +1034,6 @@ setInterval(async () => {
 
     const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
 
-    process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}%`);
+    process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | FPS: ${serverFps} |`);
     cpuUsageLog.push(Number(cpuUsagePercentage))
 }, 1000);

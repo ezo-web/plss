@@ -1,5 +1,7 @@
 const maxRadius = 200;
+const maxRadiusSquared = maxRadius * maxRadius;
 const maxClusters = 50;
+const { performance, PerformanceObserver } = require('node:perf_hooks');
 const minClusterSize = 10;
 const minSmartParticleSetSize = 20;
 const predefinedColors = [
@@ -23,9 +25,22 @@ const predefinedColors = [
     "maroon",
     "navy",
 ];
+let smoothedServerFps = 0;
+function recordServerFps(frameDurationMs) {
+    if (frameDurationMs <= 0) return Math.round(smoothedServerFps);
+
+    const frameFps = 1000 / frameDurationMs;
+    smoothedServerFps =
+        smoothedServerFps === 0
+            ? frameFps
+            : smoothedServerFps * 0.8 + frameFps * 0.2;
+
+    return Math.round(smoothedServerFps);
+}
 const settings = {
     seed: 91651088029,
     fps: 0,
+    clientFps: 0,
     atomCount: 0,
     atoms: {
         count: 500, // Per Color
@@ -65,6 +80,9 @@ const settings = {
     radii2Array: [],
     colors: [],
     numColors: 4,
+    force_scale: 1.0,
+    manual_frame_rate: false,
+    paused: false,
     time_scale: 1.0,
     viscosity: 0.7, // speed-dampening (can be >1 !)
     gravity: 0.0, // pulling downward
@@ -138,9 +156,9 @@ const smartChunking = {
     bestFps: 0,
     bestSize: 100,
     lastCandidateSize: 100,
-    framesPerSample: 50, // collect 50 frames per sample
+    framesPerSample: 10, // collect 50 frames per sample
     maxSearchRounds: 7, // run 7 rounds of evaluation
-    improvementRatio: 0.1, // require 10% improvement to keep a new candidate size
+    improvementRatio: 0.2, // require 20% improvement to keep a new candidate size
 };
 
 let smartChunkingController = null;
@@ -364,7 +382,13 @@ const setupGUI = () => {
         .onFinishChange((v) => {
             startRandom();
         });
+    if (settings.paused == false) {
+        configFolder.add(settings, "paused").name("Pause")
+    } else {
+        configFolder.add(settings, "paused").name("Unpause")
+    }
     configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
+    configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
     configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
     configFolder
         .add(settings.atoms, "count", 1, 3000, 1)
@@ -375,7 +399,15 @@ const setupGUI = () => {
             resetSmartChunking();
         });
     configFolder
-        .add(settings, "time_scale", 0.1, 5, 0.01)
+        .add(settings, "force_scale", 0.1, 5, 0.01)
+        .name("Force Scale")
+        .listen();
+    configFolder
+        .add(settings, "manual_frame_rate")
+        .name("Manual Frame Rate")
+        .listen();
+    configFolder
+        .add(settings, "time_scale", 0.01, 5, 0.01)
         .name("Time Scale")
         .listen();
     configFolder
@@ -383,7 +415,7 @@ const setupGUI = () => {
         .name("Viscosity")
         .listen();
 
-    configFolder.add(settings, "gravity", 0, 1, 0.05).name("Gravity").listen();
+    configFolder.add(settings, "gravity", -2, 2, 0.01).name("Gravity").listen();
     configFolder
         .add(settings, "explorePeriod", 1, 500, 1)
         .name("Mutation Frequency")
@@ -394,7 +426,7 @@ const setupGUI = () => {
         .listen();
 
     configFolder
-        .add(settings, "wallRepel", 0, 100, 1)
+        .add(settings, "wallRepel", 0, 200, 1)
         .name("Wall Repel")
         .listen();
     configFolder.add(settings, "explore").name("Random Mutations").listen();
@@ -531,8 +563,15 @@ function flattenRules() {
 }
 
 function updateCanvasDimensions() {
-    canvas.width = window.innerWidth * 0.9;
-    canvas.height = window.innerHeight * 0.9;
+    const nextWidth = window.innerWidth * 0.9;
+    const nextHeight = window.innerHeight * 0.9;
+    if (nextWidth === lastCanvasWidth && nextHeight === lastCanvasHeight) return false;
+
+    lastCanvasWidth = nextWidth;
+    lastCanvasHeight = nextHeight;
+    canvas.width = nextWidth;
+    canvas.height = nextHeight;
+    return true;
 }
 
 // Initiate Random locations for Atoms ( used when atoms created )
@@ -585,6 +624,8 @@ loadSeedFromUrl();
 // Canvas
 const canvas = document.getElementById("canvas");
 const m = canvas.getContext("2d");
+let lastCanvasWidth = 0;
+let lastCanvasHeight = 0;
 
 let serverStepInFlight = false;
 let serverStepFailed = false;
@@ -607,48 +648,54 @@ function applyRulesOnServer() {
     if (serverStepInFlight || serverStepFailed) return;
 
     const requestVersion = simulationVersion;
-    serverStepInFlight = true;
-    fetch("/api/apply-rules", {
-        method: "POST",
-        headers: {"Content-Type": "application/json", "Connection": "keep-alive",},
-        body: JSON.stringify({
-            atoms,
-            rulesArray: settings.rulesArray,
-            radii2Array: settings.radii2Array,
-            numColors: settings.numColors,
-            pulse,
-            pulseX: pulse_x,
-            pulseY: pulse_y,
-            timeScale: settings.time_scale,
-            wallRepel: settings.wallRepel,
-            canvasWidth: canvas.width,
-            canvasHeight: canvas.height,
-            gravity: settings.gravity,
-            viscosity: settings.viscosity,
-            chunkedThreads: settings.chunkedThreads,
-            particleSetSize: settings.particleSetSize,
-        }),
-    })
-        .then((response) => {
-            if (!response.ok)
-                throw new Error(`Server applyRules failed: ${response.status}`);
-            return response.json();
+
+    if (!settings.paused == true) {
+        serverStepInFlight = true;
+        var lastT = Date.now();
+        fetch("/api/apply-rules", {
+            method: "POST",
+            headers: {"Content-Type": "application/json", "Connection": "keep-alive",},
+            body: JSON.stringify({
+                atoms,
+                rulesArray: settings.rulesArray,
+                radii2Array: settings.radii2Array,
+                numColors: settings.numColors,
+                pulse,
+                pulseX: pulse_x,
+                pulseY: pulse_y,
+                forceScale: settings.force_scale,
+                wallRepel: settings.wallRepel,
+                canvasWidth: canvas.width,
+                canvasHeight: canvas.height,
+                gravity: settings.gravity,
+                viscosity: settings.viscosity,
+                chunkedThreads: settings.chunkedThreads,
+                particleSetSize: settings.particleSetSize,
+            }),
         })
-        .then((result) => {
-            if (requestVersion !== simulationVersion) return;
-            total_v = result.totalV;
-            if (Number.isFinite(result.fps)) settings.fps = result.fps;
-            settings.atomCount = result.atoms.length;
-            syncServerAtoms(result.atoms);
-            updateSmartChunking(result.fps);
-        })
-        .catch((error) => {
-            serverStepFailed = true;
-            console.warn("Server applyRules unavailable; simulation paused.", error);
-        })
-        .finally(() => {
-            serverStepInFlight = false;
-        });
+            .then((response) => {
+                if (!response.ok)
+                    throw new Error(`Server applyRules failed: ${response.status}`);
+                return response.json();
+            })
+            .then((result) => {
+                if (requestVersion !== simulationVersion) return;
+                total_v = result.totalV;
+                settings.fps = recordServerFps(performance.now() - result.frameStartTime);
+                settings.atomCount = result.atoms.length;
+                syncServerAtoms(result.atoms);
+                updateSmartChunking(result.fps);
+            })
+            .catch((error) => {
+                serverStepFailed = true;
+                console.warn("Server applyRules unavailable; simulation paused.", error);
+            })
+            .finally(() => {
+                serverStepInFlight = false;
+            });
+    } else {
+        settings.fps = 0
+    }
 }
 
 // Draw a square
@@ -680,6 +727,7 @@ function drawLineBetweenAtoms(ax, ay, bx, by, color) {
 //    /* tmp accumulators: */
 //  {count, accum-x, accum-y, accum-d^2, accum-color}]
 let clusters = [];
+let clusterAccums = [];
 
 function newCluster() {
     return [randomX(), randomY(), maxRadius, "white"];
@@ -689,6 +737,26 @@ function addNewClusters(num_clusters) {
     if (clusters.length < num_clusters / 2) {
         while (clusters.length < num_clusters) clusters.push(newCluster());
     }
+}
+
+function getClusterAccums(count) {
+    if (clusterAccums.length < count) {
+        for (let i = clusterAccums.length; i < count; ++i) {
+            clusterAccums[i] = [0, 0, 0, 0, 0];
+        }
+    }
+
+    for (let i = 0; i < count; ++i) {
+        const a = clusterAccums[i];
+        a[0] = 0;
+        a[1] = 0;
+        a[2] = 0;
+        a[3] = 0;
+        a[4] = 0;
+    }
+
+    clusterAccums.length = count;
+    return clusterAccums;
 }
 
 function findNearestCluster(x, y) {
@@ -745,14 +813,14 @@ function finalizeClusters(accums) {
 
 function trackClusters() {
     addNewClusters(maxClusters);
-    let accums = [];
-    for (const c of clusters) accums.push([0, 0, 0, 0, 0]);
+    const accums = getClusterAccums(clusters.length);
+    const atomCount = atoms.length;
     const maxKMeanPasses = 10;
     for (let pass = maxKMeanPasses; pass >= 0; --pass) {
-        for (let a of accums) a = [0, 0, 0, 0, 0];
-        for (const c of atoms) {
+        for (let i = 0; i < atomCount; ++i) {
+            const c = atoms[i];
             const [best, best_d2] = findNearestCluster(c[0], c[1]);
-            if (best >= 0 && best_d2 < maxRadius * maxRadius) {
+            if (best >= 0 && best_d2 < maxRadiusSquared) {
                 accums[best][0] += 1;
                 accums[best][1] += c[0];
                 accums[best][2] += c[1];
@@ -837,25 +905,55 @@ setupGUI();
 
 console.log("settings", settings);
 
+let framesSinceLastRequest = 0;
+var lastT = Date.now();
 update();
 
 function update() {
     // Update Canvas Dimensions - if screen size changed
     updateCanvasDimensions();
     // Background color
-    m.fillStyle = settings.drawings.background_color;
+    const drawings = settings.drawings;
+    const colors = settings.colors;
+    const atomRadius = settings.atoms.radius;
+    m.fillStyle = drawings.background_color;
     m.fillRect(0, 0, canvas.width, canvas.height);
-    // Appy Rules
-    applyRules();
-    // Draw Atoms
-    for (const a of atoms) {
-        if (settings.drawings.circle) {
-            drawCircle(a[0], a[1], settings.colors[a[4]], settings.atoms.radius);
+
+    // Apply Rules with manual frame rate control
+    if (!settings.manual_frame_rate) {
+        applyRules();
+    } else {
+        if (settings.time_scale >= 1) {
+            // Request multiple frames for acceleration (sequentially)
+            const frameCount = Math.round(settings.time_scale);
+            for (let i = 0; i < frameCount; i++) {
+                // Use setTimeout to ensure sequential requests
+                setTimeout(() => applyRules(), i * 10);
+            }
         } else {
-            drawSquare(a[0], a[1], settings.colors[a[4]], settings.atoms.radius);
+            // Skip frames for deceleration
+            const frameSkip = Math.round(1 / settings.time_scale);
+            framesSinceLastRequest++;
+            if (framesSinceLastRequest >= frameSkip) {
+                applyRules();
+                framesSinceLastRequest = 0;
+            }
         }
     }
-    if (settings.drawings.clusters) {
+    // Draw Atoms
+    const atomCount = atoms.length;
+    if (drawings.circle) {
+        for (let i = 0; i < atomCount; ++i) {
+            const a = atoms[i];
+            drawCircle(a[0], a[1], colors[a[4]], atomRadius);
+        }
+    } else {
+        for (let i = 0; i < atomCount; ++i) {
+            const a = atoms[i];
+            drawSquare(a[0], a[1], colors[a[4]], atomRadius);
+        }
+    }
+    if (drawings.clusters) {
         trackClusters();
         drawClusters();
     }
@@ -868,13 +966,20 @@ function update() {
     requestAnimationFrame(update);
 }
 
+async function getClientFps() {
+    var curT = Date.now();
+    if (curT > await lastT) {
+        const new_fps = 1000. / (curT - lastT);
+        settings.clientFps = Math.round(settings.clientFps * 0.8 + new_fps * 0.2)
+        lastT = curT;
+    }
+}
+
 // post-frame stats and updates
 function updateParams() {
-    // adapt time_scale based on activity
-    if (total_v > 30 && settings.time_scale > 5) settings.time_scale /= 1.1;
-    if (settings.time_scale < 0.9) settings.time_scale *= 1.01;
-    if (settings.time_scale > 1.1) settings.time_scale /= 1.01;
-
+    getClientFps();
+    // adapt force_scale based on activity
+    if (total_v > 30 && settings.force_scale > 5) settings.force_scale /= 1.1;
     if (pulse != 0) pulse -= pulse > 0 ? 1 : -1;
     if (settings.explore) exploreParameters();
 }
