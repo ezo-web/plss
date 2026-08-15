@@ -64,23 +64,26 @@ let gpuBackend = null;
 
 async function initWebGPU() {
     try {
-        // Try common Node WebGPU packages
+        // Try several possible Node WebGPU package names (project may have installed a different one)
+        const candidates = ['webgpu', '@webgpu/wgpu', 'node-webgpu', '@webgpu/node', 'wgpu'];
         let nodeGpu = null;
-        try {
-            nodeGpu = require('@webgpu/wgpu');
-        } catch (e) {
+        let loadedPackageName = null;
+        for (const name of candidates) {
             try {
-                nodeGpu = require('node-webgpu');
-            } catch (e2) {
-                nodeGpu = null;
+                nodeGpu = require(name);
+                loadedPackageName = name;
+                break;
+            } catch (e) {
+                // ignore and try next
             }
         }
 
         if (!nodeGpu) {
-            console.warn('No Node WebGPU package found; GPU path disabled. Install @webgpu/wgpu for WebGPU support.');
+            console.warn('No Node WebGPU package found; GPU path disabled. Install @webgpu/wgpu or compatible package for WebGPU support.');
             return;
         }
 
+        console.log('Using WebGPU package:', loadedPackageName);
         // Some packages export navigator.gpu-like API under .gpu
         const gpuAPI = nodeGpu.gpu || nodeGpu;
 
