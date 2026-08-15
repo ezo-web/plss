@@ -110,42 +110,35 @@ async function initWebGPU() {
 }
 
 // Kick off initialization but don't block startup; runRulesUpdate will wait if needed
-initWebGPU();
+const gpuInitPromise = initWebGPU();
 
-// applyRulesOnGPU: attempts to compute the same rules using a WebGPU compute shader.
-// Note: The WGSL shader uses f32 arithmetic; inputs are converted to f32 and outputs are converted back to JS numbers.
-async function applyRulesOnGPU(input) {
-    if (!gpuAvailable || !gpuDevice) throw new Error('WebGPU device not available');
+// GPU resource cache to avoid re-creating pipelines and buffers each frame
+const gpuResources = {
+    maxAtoms: 0,
+    maxRules: 0,
+    maxRadii: 0,
+    shaderModule: null,
+    pipeline: null,
+    bindGroup: null,
+    atomsInBuf: null,
+    atomsOutBuf: null,
+    rulesBuf: null,
+    radiiBuf: null,
+    paramsBuf: null,
+    readbackBuf: null,
+};
 
-    const atomCount = input.atoms.length;
-    if (atomCount === 0) return {atoms: [], totalV: 0};
-
-    // Convert inputs to Float32 arrays for GPU
-    const atomsF32 = new Float32Array(atomCount * atomValueCount);
-    for (let i = 0; i < atomCount; i++) {
-        const a = input.atoms[i];
-        const off = i * atomValueCount;
-        atomsF32[off] = a[0];
-        atomsF32[off + 1] = a[1];
-        atomsF32[off + 2] = a[2];
-        atomsF32[off + 3] = a[3];
-        atomsF32[off + 4] = a[4];
-    }
-
-    const rulesF32 = new Float32Array(input.rulesArray.map((v) => v));
-    const radiiF32 = new Float32Array(input.radii2Array.map((v) => v));
-
-    // Build WGSL compute shader implementing the same physics loop.
-    const shaderWGSL = `
+function ensureGPUResources(atomCount, ruleCount, radiiCount) {
+    const device = gpuDevice;
+    // Create pipeline/shader once
+    if (!gpuResources.pipeline) {
+        const shaderWGSL = `
 struct Atom { x: f32; y: f32; vx: f32; vy: f32; color: f32; };
 @group(0) @binding(0) var<storage, read> atoms_in: array<Atom>;
 @group(0) @binding(1) var<storage, read_write> atoms_out: array<Atom>;
 @group(0) @binding(2) var<storage, read> rules: array<f32>;
 @group(0) @binding(3) var<storage, read> radii2: array<f32>;
 @group(0) @binding(4) var<uniform> params: array<f32>;
-
-// params layout (indexes)
-// 0: atomCount, 1: numColors, 2: forceScale, 3: pulse, 4: pulseX, 5: pulseY, 6: wallRepel, 7: canvasWidth, 8: canvasHeight, 9: gravity, 10: viscosity
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
@@ -164,7 +157,6 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
     var fx: f32 = 0.0;
     var fy: f32 = 0.0;
 
-    // loop over other atoms
     var j: i32 = 0;
     for (; j < count; j = j + 1) {
         if (j == i) { continue; }
@@ -176,7 +168,8 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
         let d = dx * dx + dy * dy;
         if (d < r2 && d > 0.0) {
             let otherColor = i32(atoms_in[j].color);
-            let g = rules[f32(ruleRow + otherColor)];
+            let idx = ruleRow + otherColor;
+            let g = rules[idx];
             let inv = 1.0 / sqrt(d);
             let f = g * inv;
             fx = fx + f * dx;
@@ -206,7 +199,6 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
         if (ay > params[8] - d) { fy = fy + (params[8] - d - ay) * strength; }
     }
 
-    // update
     var fy_total = fy + params[9];
     let vmix = 1.0 - params[10];
     var vx = avx * vmix + fx * params[2];
@@ -226,19 +218,80 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
     atoms_out[i].color = atoms_in[i].color;
 }
 `;
+        gpuResources.shaderModule = device.createShaderModule({code: shaderWGSL});
+        gpuResources.pipeline = device.createComputePipeline({compute: {module: gpuResources.shaderModule, entryPoint: 'main'}});
+    }
 
-    // Create GPU resources
+    // Grow buffers if needed
+    const atomBytes = atomCount * atomValueCount * 4; // f32
+    if (!gpuResources.atomsInBuf || gpuResources.maxAtoms < atomCount) {
+        gpuResources.maxAtoms = Math.max(atomCount, gpuResources.maxAtoms * 2 || atomCount);
+        const size = gpuResources.maxAtoms * atomValueCount * 4;
+        gpuResources.atomsInBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+        gpuResources.atomsOutBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+        // readback buffer
+        gpuResources.readbackBuf = device.createBuffer({size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+    }
+
+    if (!gpuResources.rulesBuf || gpuResources.maxRules < ruleCount) {
+        gpuResources.maxRules = Math.max(ruleCount, gpuResources.maxRules * 2 || ruleCount);
+        const size = gpuResources.maxRules * 4;
+        gpuResources.rulesBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+    }
+
+    if (!gpuResources.radiiBuf || gpuResources.maxRadii < radiiCount) {
+        gpuResources.maxRadii = Math.max(radiiCount, gpuResources.maxRadii * 2 || radiiCount);
+        const size = gpuResources.maxRadii * 4;
+        gpuResources.radiiBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+    }
+
+    // params buffer fixed small size
+    if (!gpuResources.paramsBuf) {
+        gpuResources.paramsBuf = device.createBuffer({size: 11 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+    }
+
+    // Recreate bind group to reference current buffers
+    gpuResources.bindGroup = gpuDevice.createBindGroup({
+        layout: gpuResources.pipeline.getBindGroupLayout(0),
+        entries: [
+            {binding: 0, resource: {buffer: gpuResources.atomsInBuf}},
+            {binding: 1, resource: {buffer: gpuResources.atomsOutBuf}},
+            {binding: 2, resource: {buffer: gpuResources.rulesBuf}},
+            {binding: 3, resource: {buffer: gpuResources.radiiBuf}},
+            {binding: 4, resource: {buffer: gpuResources.paramsBuf}},
+        ],
+    });
+}
+
+async function applyRulesOnGPU(input) {
+    if (!gpuAvailable || !gpuDevice) throw new Error('WebGPU device not available');
+    const atomCount = input.atoms.length;
+    if (atomCount === 0) return {atoms: [], totalV: 0};
+
+    const atomsF32 = new Float32Array(atomCount * atomValueCount);
+    for (let i = 0; i < atomCount; i++) {
+        const a = input.atoms[i];
+        const off = i * atomValueCount;
+        atomsF32[off] = a[0];
+        atomsF32[off + 1] = a[1];
+        atomsF32[off + 2] = a[2];
+        atomsF32[off + 3] = a[3];
+        atomsF32[off + 4] = a[4];
+    }
+
+    const rulesF32 = new Float32Array(input.rulesArray.map((v) => v));
+    const radiiF32 = new Float32Array(input.radii2Array.map((v) => v));
+
+    // ensure buffers/pipeline sized
+    ensureGPUResources(atomCount, rulesF32.length, radiiF32.length);
+
     const device = gpuDevice;
-    const shaderModule = device.createShaderModule({code: shaderWGSL});
-    const pipeline = device.createComputePipeline({compute: {module: shaderModule, entryPoint: 'main'}});
 
-    // Create buffers (GPUBuffer usage flags vary by binding)
-    const atomsInBuf = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-    const atomsOutBuf = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
-    const rulesBuf = device.createBuffer({size: rulesF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-    const radiiBuf = device.createBuffer({size: radiiF32.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+    // Upload only the needed ranges
+    device.queue.writeBuffer(gpuResources.atomsInBuf, 0, atomsF32.buffer, atomsF32.byteOffset, atomsF32.byteLength);
+    device.queue.writeBuffer(gpuResources.rulesBuf, 0, rulesF32.buffer, rulesF32.byteOffset, rulesF32.byteLength);
+    device.queue.writeBuffer(gpuResources.radiiBuf, 0, radiiF32.buffer, radiiF32.byteOffset, radiiF32.byteLength);
 
-    // Uniforms: small float32 array
     const paramsArray = new Float32Array([
         atomCount,
         input.numColors,
@@ -252,49 +305,27 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
         input.gravity,
         input.viscosity,
     ]);
-    const paramsBuf = device.createBuffer({size: paramsArray.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(gpuResources.paramsBuf, 0, paramsArray.buffer, paramsArray.byteOffset, paramsArray.byteLength);
 
-    // Upload data
-    device.queue.writeBuffer(atomsInBuf, 0, atomsF32.buffer, atomsF32.byteOffset, atomsF32.byteLength);
-    device.queue.writeBuffer(rulesBuf, 0, rulesF32.buffer, rulesF32.byteOffset, rulesF32.byteLength);
-    device.queue.writeBuffer(radiiBuf, 0, radiiF32.buffer, radiiF32.byteOffset, radiiF32.byteLength);
-    device.queue.writeBuffer(paramsBuf, 0, paramsArray.buffer, paramsArray.byteOffset, paramsArray.byteLength);
-
-    // Bind group
-    const bindGroup = device.createBindGroup({
-        layout: pipeline.getBindGroupLayout(0),
-        entries: [
-            {binding: 0, resource: {buffer: atomsInBuf}},
-            {binding: 1, resource: {buffer: atomsOutBuf}},
-            {binding: 2, resource: {buffer: rulesBuf}},
-            {binding: 3, resource: {buffer: radiiBuf}},
-            {binding: 4, resource: {buffer: paramsBuf}},
-        ],
-    });
-
-    // Encode commands
     const commandEncoder = device.createCommandEncoder();
     const pass = commandEncoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setPipeline(gpuResources.pipeline);
+    pass.setBindGroup(0, gpuResources.bindGroup);
     const workgroupSize = 64;
     const numGroups = Math.ceil(atomCount / workgroupSize);
     pass.dispatchWorkgroups(numGroups);
     pass.end();
 
-    // Copy output to a mappable buffer
-    const readback = device.createBuffer({size: atomsF32.byteLength, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
-    commandEncoder.copyBufferToBuffer(atomsOutBuf, 0, readback, 0, atomsF32.byteLength);
-
+    commandEncoder.copyBufferToBuffer(gpuResources.atomsOutBuf, 0, gpuResources.readbackBuf, 0, atomCount * atomValueCount * 4);
     device.queue.submit([commandEncoder.finish()]);
 
-    // Map and read results
-    await readback.mapAsync(0, 0, atomsF32.byteLength);
-    const mapped = readback.getMappedRange();
+    // Map and read results (use numeric READ flag if constants are not exposed)
+    const MAP_READ = (typeof gpuBackend !== 'undefined' && gpuBackend.GPUMapMode && gpuBackend.GPUMapMode.READ) || 1;
+    await gpuResources.readbackBuf.mapAsync(MAP_READ, 0, atomCount * atomValueCount * 4);
+    const mapped = gpuResources.readbackBuf.getMappedRange(0, atomCount * atomValueCount * 4);
     const resultF32 = new Float32Array(mapped.slice(0));
-    readback.unmap();
+    gpuResources.readbackBuf.unmap();
 
-    // Convert back to JS array of arrays and compute totalV as average of (abs vx + abs vy)
     const atomsOut = new Array(atomCount);
     let totalVSum = 0;
     for (let i = 0; i < atomCount; i++) {
@@ -308,6 +339,7 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
         totalVSum += Math.abs(vx) + Math.abs(vy);
     }
 
+    console.log(`WebGPU: computed ${atomCount} atoms, avgV=${(totalVSum/atomCount).toFixed(4)}`);
     return {atoms: atomsOut, totalV: totalVSum / atomCount};
 }
 
@@ -879,17 +911,34 @@ function applyRulesChunkedOnServer(input) {
 }
 
 async function runRulesUpdate(input) {
+    // Wait briefly for GPU init if in progress
+    try {
+        await Promise.race([
+            gpuInitPromise,
+            new Promise((res) => setTimeout(res, 300)),
+        ]);
+    } catch (e) {
+        // ignore init errors; detection below will fall back
+    }
+
     if (gpuAvailable && gpuDevice) {
         try {
-            // GPU path produces same structure as CPU path: { atoms, totalV }
-            return await applyRulesOnGPU(input);
+            const t0 = performance.now();
+            const result = await applyRulesOnGPU(input);
+            const t1 = performance.now();
+            console.log(`WebGPU time: ${(t1 - t0).toFixed(2)}ms`);
+            return result;
         } catch (err) {
             console.error('WebGPU computation failed, falling back to CPU worker pool:', err && err.message ? err.message : err);
         }
     }
 
     // Fallback: existing chunked CPU/worker implementation
-    return applyRulesChunkedOnServer(input);
+    const t0 = performance.now();
+    const cpuResult = await applyRulesChunkedOnServer(input);
+    const t1 = performance.now();
+    console.log(`CPU time: ${(t1 - t0).toFixed(2)}ms`);
+    return cpuResult;
 }
 
 function recordServerFps(frameDurationMs) {
