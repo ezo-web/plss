@@ -28,6 +28,7 @@ const wasmPageBytes = 65536;
 const wasmScratchOffset = 4096;
 const atomValueCount = 5;
 const atomByteStride = atomValueCount * Float64Array.BYTES_PER_ELEMENT;
+const mode = process.env.MODE;
 const maxRequestBytes = 20 * 1024 * 1024;
 let smoothedServerFps = 0;
 const contentTypes = {
@@ -63,49 +64,51 @@ let gpuAdapter = null;
 let gpuBackend = null;
 
 async function initWebGPU() {
-    try {
-        // Try several possible Node WebGPU package names (project may have installed a different one)
-        const candidates = ['webgpu', '@webgpu/wgpu', 'node-webgpu', '@webgpu/node', 'wgpu'];
-        let nodeGpu = null;
-        let loadedPackageName = null;
-        for (const name of candidates) {
-            try {
-                nodeGpu = require(name);
-                loadedPackageName = name;
-                break;
-            } catch (e) {
-                // ignore and try next
+    if (mode == "GPU") {
+        try {
+            // Try several possible Node WebGPU package names (project may have installed a different one)
+            const candidates = ['webgpu', '@webgpu/wgpu', 'node-webgpu', '@webgpu/node', 'wgpu'];
+            let nodeGpu = null;
+            let loadedPackageName = null;
+            for (const name of candidates) {
+                try {
+                    nodeGpu = require(name);
+                    loadedPackageName = name;
+                    break;
+                } catch (e) {
+                    // ignore and try next
+                }
             }
-        }
 
-        if (!nodeGpu) {
-            console.warn('No Node WebGPU package found; GPU path disabled. Install @webgpu/wgpu or compatible package for WebGPU support.');
-            return;
-        }
+            if (!nodeGpu) {
+                console.warn('No Node WebGPU package found; GPU path disabled. Install @webgpu/wgpu or compatible package for WebGPU support.');
+                return;
+            }
 
-        // console.log('Using WebGPU package:', loadedPackageName);
-        // Some packages export navigator.gpu-like API under .gpu
-        const gpuAPI = nodeGpu.gpu || nodeGpu;
+            console.log('Using WebGPU package:', loadedPackageName);
+            // Some packages export navigator.gpu-like API under .gpu
+            const gpuAPI = nodeGpu.gpu || nodeGpu;
 
-        // requestAdapter / requestDevice are async in the modern API
-        if (typeof gpuAPI.requestAdapter === 'function') {
-            gpuAdapter = await gpuAPI.requestAdapter();
-            gpuDevice = await gpuAdapter.requestDevice();
-        } else if (typeof gpuAPI.requestDevice === 'function') {
-            // some bindings expose direct device creation
-            gpuDevice = await gpuAPI.requestDevice();
-        } else if (typeof nodeGpu.requestAdapter === 'function') {
-            gpuAdapter = await nodeGpu.requestAdapter();
-            gpuDevice = await gpuAdapter.requestDevice();
-        }
+            // requestAdapter / requestDevice are async in the modern API
+            if (typeof gpuAPI.requestAdapter === 'function') {
+                gpuAdapter = await gpuAPI.requestAdapter();
+                gpuDevice = await gpuAdapter.requestDevice();
+            } else if (typeof gpuAPI.requestDevice === 'function') {
+                // some bindings expose direct device creation
+                gpuDevice = await gpuAPI.requestDevice();
+            } else if (typeof nodeGpu.requestAdapter === 'function') {
+                gpuAdapter = await nodeGpu.requestAdapter();
+                gpuDevice = await gpuAdapter.requestDevice();
+            }
 
-        if (gpuDevice) {
-            gpuAvailable = true;
-            gpuBackend = nodeGpu;
-            console.log('WebGPU initialized for server-side rule computation.');
+            if (gpuDevice) {
+                gpuAvailable = true;
+                gpuBackend = nodeGpu;
+                console.log('WebGPU initialized for server-side rule computation.');
+            }
+        } catch (err) {
+            console.warn('WebGPU initialization failed, falling back to WASM/CPU path:', err && err.message ? err.message : err);
         }
-    } catch (err) {
-        console.warn('WebGPU initialization failed, falling back to WASM/CPU path:', err && err.message ? err.message : err);
     }
 }
 
@@ -219,7 +222,12 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
 }
 `;
         gpuResources.shaderModule = device.createShaderModule({code: shaderWGSL});
-        gpuResources.pipeline = device.createComputePipeline({compute: {module: gpuResources.shaderModule, entryPoint: 'main'}});
+        gpuResources.pipeline = device.createComputePipeline({
+            compute: {
+                module: gpuResources.shaderModule,
+                entryPoint: 'main'
+            }
+        });
     }
 
     // Grow buffers if needed
@@ -227,27 +235,45 @@ fn main(@builtin(global_invocation_id) GlobalId : vec3<u32>) {
     if (!gpuResources.atomsInBuf || gpuResources.maxAtoms < atomCount) {
         gpuResources.maxAtoms = Math.max(atomCount, gpuResources.maxAtoms * 2 || atomCount);
         const size = gpuResources.maxAtoms * atomValueCount * 4;
-        gpuResources.atomsInBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
-        gpuResources.atomsOutBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+        gpuResources.atomsInBuf = device.createBuffer({
+            size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
+        gpuResources.atomsOutBuf = device.createBuffer({
+            size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+        });
         // readback buffer
-        gpuResources.readbackBuf = device.createBuffer({size, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+        gpuResources.readbackBuf = device.createBuffer({
+            size,
+            usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+        });
     }
 
     if (!gpuResources.rulesBuf || gpuResources.maxRules < ruleCount) {
         gpuResources.maxRules = Math.max(ruleCount, gpuResources.maxRules * 2 || ruleCount);
         const size = gpuResources.maxRules * 4;
-        gpuResources.rulesBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+        gpuResources.rulesBuf = device.createBuffer({
+            size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
     }
 
     if (!gpuResources.radiiBuf || gpuResources.maxRadii < radiiCount) {
         gpuResources.maxRadii = Math.max(radiiCount, gpuResources.maxRadii * 2 || radiiCount);
         const size = gpuResources.maxRadii * 4;
-        gpuResources.radiiBuf = device.createBuffer({size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST});
+        gpuResources.radiiBuf = device.createBuffer({
+            size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        });
     }
 
     // params buffer fixed small size
     if (!gpuResources.paramsBuf) {
-        gpuResources.paramsBuf = device.createBuffer({size: 11 * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+        gpuResources.paramsBuf = device.createBuffer({
+            size: 11 * 4,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+        });
     }
 
     // Recreate bind group to reference current buffers
@@ -339,7 +365,7 @@ async function applyRulesOnGPU(input) {
         totalVSum += Math.abs(vx) + Math.abs(vy);
     }
 
-    console.log(`WebGPU: computed ${atomCount} atoms, avgV=${(totalVSum/atomCount).toFixed(4)}`);
+    console.log(`WebGPU: computed ${atomCount} atoms, avgV=${(totalVSum / atomCount).toFixed(4)}`);
     return {atoms: atomsOut, totalV: totalVSum / atomCount};
 }
 
@@ -990,7 +1016,7 @@ const server = http.createServer((request, response) => {
                 .then((result) => {
                     const fps = recordServerFps(performance.now() - frameStartTime);
                     serverFps = fps;
-                    send(response, 200, JSON.stringify({...result, fps, frameStartTime}), {
+                    send(response, 200, JSON.stringify({...result, fps, frameStartTime, deviceCores}), {
                         "Content-Type": "application/json; charset=utf-8",
                     });
                 })
@@ -1034,13 +1060,22 @@ const server = http.createServer((request, response) => {
 server.listen(port, HOST, () => {
     var startMessage
     if (Number(deviceCores) < 8) {
-        startMessage = `[WARNING] YOUR DEVICE DOES NOT MEET THE RECOMMENDED HARDWARE REQUIREMENTS TO RUN PLSS. PROCEED WITH CAUTION AND DO NOT USE MORE THAN 4500 PARTICLES IN YOUR SIMULATION.`
+        startMessage = `[WARNING] YOUR DEVICE DOES NOT MEET THE RECOMMENDED HARDWARE REQUIREMENTS TO RUN PLSS. PROCEED WITH CAUTION AND DO NOT USE MORE THAN 2500 PARTICLES IN YOUR SIMULATION.`
     }
-    if (Number(deviceCores) >= 8) {
-        startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism is disabled as your devices does not meet the minimum requirements to use the feature\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
-    }
-    if (Number(deviceCores) >= 10) {
-        startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism may cause lag spikes while evaluating, this is normal and should stop after it's done\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+    if (HOST !== "0.0.0.0") {
+        if (Number(deviceCores) >= 8) {
+            startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism is disabled as your devices does not meet the minimum requirements to use the feature\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        }
+        if (Number(deviceCores) >= 10) {
+            startMessage = `| Serving PLSS on http://${HOST}:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism may cause lag spikes while evaluating, this is normal and should stop after it's done\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        }
+    } else {
+        if (Number(deviceCores) >= 8) {
+            startMessage = `| Serving PLSS on http://localhost:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism is disabled as your devices does not meet the minimum requirements to use the feature\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        }
+        if (Number(deviceCores) >= 10) {
+            startMessage = `| Serving PLSS on http://localhost:${port}\n\n| Information and configuration: \n | Default Mode configured with a worker pool of ${ruleWorkerPool.size} rule workers\n | Fine Threading Mode is not bound by this worker pool, use it with caution\n | Smart Parallelism may cause lag spikes while evaluating, this is normal and should stop after it's done\n | PLSS's server-side code is spawning workers that run the following program: ${wasmPath}\n\n| Your device's hardware details:\n | Cores: ${deviceCores}\n | Model: ${cpuModel}\n | Clock Speed: ${cpuMHz}MHz\n\n| PLSS's system usage metrics:`
+        }
     }
 
     console.log(`${startMessage}`);

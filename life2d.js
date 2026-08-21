@@ -25,9 +25,11 @@ const predefinedColors = [
     "navy",
 ];
 const settings = {
+    deviceCoreCount: 0,
     seed: 91651088029,
     fps: 0,
     clientFps: 0,
+    commonFps: 0,
     framesThisSecond: 0,
     atomCount: 0,
     atoms: {
@@ -347,7 +349,7 @@ function updateSmartChunking(fps) {
 }
 
 // Build GUI
-const setupGUI = () => {
+const setupGUI = (async () => {
     settings.gui = new lil.GUI();
     // Configs
     const configFolder = settings.gui.addFolder("Config");
@@ -377,6 +379,7 @@ const setupGUI = () => {
     }
     configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
     configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
+    configFolder.add(settings, "commonFps").name("FPS - (Common)").listen().disable();
     configFolder.add(settings, "framesThisSecond").name("Frames This Seconds").listen().disable();
     configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
     configFolder
@@ -419,15 +422,16 @@ const setupGUI = () => {
         .name("Wall Repel")
         .listen();
     configFolder.add(settings, "explore").name("Random Mutations").listen();
-    configFolder
-        .add(settings, "chunkedThreads")
-        .name("Fine Threading")
-        .listen()
-        .onFinishChange(() => {
-            updateChunkingControllers();
-            resetSmartChunking();
-            invalidateServerStep();
-        });
+    setTimeout(async() => {if (await settings.deviceCoreCount >= 8) {
+        configFolder
+            .add(settings, "chunkedThreads")
+            .name("Fine Threading")
+            .listen()
+            .onFinishChange(() => {
+                updateChunkingControllers();
+                resetSmartChunking();
+                invalidateServerStep();
+            });
     smartChunkingController = configFolder
         .add(settings, "smartChunking")
         .name("Smart Parallelism")
@@ -443,6 +447,7 @@ const setupGUI = () => {
         .onFinishChange((v) => {
             setParticleSetSize(v);
         });
+    }}, 100);
     updateChunkingControllers();
     // Drawings
     const drawingsFolder = settings.gui.addFolder("Drawings");
@@ -486,7 +491,7 @@ const setupGUI = () => {
                 flattenRules();
             });
     }
-};
+});
 
 // Seedable 'decent' random generator
 var local_seed = settings.seed;
@@ -633,17 +638,20 @@ function syncServerAtoms(nextAtoms) {
     }
 }
 
+var numberOfRequests = 0;
+
 function applyRulesOnServer() {
     if (serverStepInFlight || serverStepFailed) return;
 
     const requestVersion = simulationVersion;
+    const requestStartedAt = performance.now();
 
     if (!settings.paused == true) {
         serverStepInFlight = true;
         var lastT = Date.now();
         fetch("/api/apply-rules", {
             method: "POST",
-            headers: {"Content-Type": "application/json", "Connection": "keep-alive",},
+            headers: {"Content-Type": "application/json", "Connection": "keep-alive"},
             body: JSON.stringify({
                 atoms,
                 rulesArray: settings.rulesArray,
@@ -663,6 +671,13 @@ function applyRulesOnServer() {
             }),
         })
             .then((response) => {
+                const roundTripMs = performance.now() - requestStartedAt;
+                if (roundTripMs > 0) {
+                    const newFps = 1000 / roundTripMs;
+                    settings.commonFps = Math.round(
+                        settings.commonFps * 0.8 + newFps * 0.2,
+                    );
+                }
                 if (!response.ok)
                     throw new Error(`Server applyRules failed: ${response.status}`);
                 return response.json();
@@ -672,6 +687,9 @@ function applyRulesOnServer() {
                 total_v = result.totalV;
                 settings.fps = result.fps;
                 settings.atomCount = result.atoms.length;
+                if (numberOfRequests === 0) {
+                settings.deviceCoreCount = result.deviceCores;
+                }
                 syncServerAtoms(result.atoms);
                 settings.framesThisSecond += 1
                 updateSmartChunking(result.fps);
@@ -685,6 +703,7 @@ function applyRulesOnServer() {
             });
     } else {
         settings.fps = 0
+        settings.commonFps = 0
     }
 }
 
