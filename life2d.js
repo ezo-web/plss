@@ -1030,21 +1030,22 @@ function updateParams() {
 }
 
 // Build CSV from smart chunking results and download
+// Each row: round, phase, particles_per_thread, average_fps
 function buildSmartChunkingCSV() {
     if (!smartChunking.results || smartChunking.results.length === 0) return "";
     const rows = [];
     // header
-    rows.push(["round", "phase", "samples"].join(","));
+    rows.push(["round", "phase", "particles_per_thread", "average_fps"].join(","));
 
     for (let i = 0; i < smartChunking.results.length; ++i) {
         const r = smartChunking.results[i];
-        const sampleCols = r.sizes.map((s, idx) => {
+        for (let idx = 0; idx < r.sizes.length; ++idx) {
+            const size = r.sizes[idx];
             const fps = r.fps[idx];
             const fpsStr = fps == null || !Number.isFinite(fps) ? "" : fps.toFixed(2);
-            // encode as size:fps to keep association
-            return `"${s}:${fpsStr}"`;
-        });
-        rows.push([i, r.phase, ...sampleCols].join(","));
+            // push as a single row
+            rows.push([i, r.phase, size, fpsStr].join(","));
+        }
     }
 
     return rows.join("\n");
