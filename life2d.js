@@ -3,6 +3,8 @@ const maxRadiusSquared = maxRadius * maxRadius;
 const maxClusters = 50;
 const minClusterSize = 10;
 const minSmartParticleSetSize = 20;
+const clientId = Math.floor(Math.random() * (5000 - 1000 + 1)) + 1000;
+console.log(clientId);
 const predefinedColors = [
     "green",
     "red",
@@ -30,6 +32,7 @@ const settings = {
     fps: 0,
     clientFps: 0,
     commonFps: 0,
+    totv: 0,
     framesThisSecond: 0,
     atomCount: 0,
     atoms: {
@@ -149,6 +152,9 @@ const smartChunking = {
     framesPerSample: 10, // collect 50 frames per sample
     maxSearchRounds: 7, // run 7 rounds of evaluation
     improvementRatio: 0.2, // require 20% improvement to keep a new candidate size
+    // results: array of rounds { phase, sizes: [...], fps: [...] }
+    results: [],
+    currentRoundIndex: -1,
 };
 
 let smartChunkingController = null;
@@ -246,6 +252,14 @@ function startSmartChunkingCandidates(candidates, phase) {
 
     smartChunking.lastCandidateSize = smartChunking.candidates[0];
     setParticleSetSize(smartChunking.lastCandidateSize);
+
+    // start a new results round for CSV export
+    smartChunking.results.push({
+        phase,
+        sizes: smartChunking.candidates.slice(),
+        fps: new Array(smartChunking.candidates.length).fill(null),
+    });
+    smartChunking.currentRoundIndex = smartChunking.results.length - 1;
 }
 
 async function updateChunkingControllers() {
@@ -278,6 +292,10 @@ function resetSmartChunking() {
         : clampParticleSetSize(settings.particleSetSize);
     smartChunking.lastCandidateSize = smartChunking.bestSize;
     setParticleSetSize(smartChunking.bestSize);
+
+    // reset any previous results
+    smartChunking.results = [];
+    smartChunking.currentRoundIndex = -1;
 
     if (smartChunking.active) {
         startSmartChunkingCandidates(getCoarseSmartChunkingCandidates(), "coarse");
@@ -317,11 +335,27 @@ function settleSmartChunking() {
     smartChunking.settled = true;
     smartChunking.phase = "settled";
     setParticleSetSize(smartChunking.bestSize);
+
+    // Download results as CSV when smart chunking finishes
+    try {
+        downloadSmartChunkingResults();
+    } catch (e) {
+        console.warn('Failed to download smart chunking CSV', e);
+    }
 }
 
 function updateSmartChunking(fps) {
     const averageFps = sampleSmartChunking(fps);
     if (averageFps === null) return;
+
+    // store the sample for CSV export if we have a current round
+    if (
+        smartChunking.currentRoundIndex !== -1 &&
+        smartChunking.results[smartChunking.currentRoundIndex]
+    ) {
+        const roundEntry = smartChunking.results[smartChunking.currentRoundIndex];
+        roundEntry.fps[smartChunking.candidateIndex] = averageFps;
+    }
 
     if (smartChunkingImproved(averageFps)) {
         smartChunking.bestFps = averageFps;
@@ -381,6 +415,7 @@ const setupGUI = (async () => {
     configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
     configFolder.add(settings, "commonFps").name("FPS - (Common)").listen().disable();
     configFolder.add(settings, "framesThisSecond").name("Frames This Seconds").listen().disable();
+    configFolder.add(settings, "totv").name("Total V").listen().disable();
     configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
     configFolder
         .add(settings.atoms, "count", 1, 3000, 1)
@@ -685,6 +720,7 @@ function applyRulesOnServer() {
             .then((result) => {
                 if (requestVersion !== simulationVersion) return;
                 total_v = result.totalV;
+                settings.totv = Math.round(result.totalV * 10) / 10;
                 settings.fps = result.fps;
                 settings.atomCount = result.atoms.length;
                 if (numberOfRequests === 0) {
@@ -991,6 +1027,38 @@ function updateParams() {
     if (total_v > 30 && settings.force_scale > 5) settings.force_scale /= 1.1;
     if (pulse != 0) pulse -= pulse > 0 ? 1 : -1;
     if (settings.explore) exploreParameters();
+}
+
+// Build CSV from smart chunking results and download
+function buildSmartChunkingCSV() {
+    if (!smartChunking.results || smartChunking.results.length === 0) return "";
+    const rows = [];
+    // header
+    rows.push(["round", "phase", "samples"].join(","));
+
+    for (let i = 0; i < smartChunking.results.length; ++i) {
+        const r = smartChunking.results[i];
+        const sampleCols = r.sizes.map((s, idx) => {
+            const fps = r.fps[idx];
+            const fpsStr = fps == null || !Number.isFinite(fps) ? "" : fps.toFixed(2);
+            // encode as size:fps to keep association
+            return `"${s}:${fpsStr}"`;
+        });
+        rows.push([i, r.phase, ...sampleCols].join(","));
+    }
+
+    return rows.join("\n");
+}
+
+function downloadSmartChunkingResults() {
+    const csv = buildSmartChunkingCSV();
+    if (!csv) return;
+    const blob = new Blob([csv], {type: "text/csv"});
+    const url = URL.createObjectURL(blob);
+    const name = `smart_chunking_results_${settings.seed}.csv`;
+    dataURL_downloader(url, name);
+    // free the object URL after a short delay
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // Download DataURL
