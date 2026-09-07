@@ -1,6 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
+var monitorRounds = 0
 const path = require("node:path");
 var connectedClients = []
 const readline = require('readline');
@@ -1025,7 +1026,7 @@ const server = http.createServer((request, response) => {
 
             // update monitor last input
             if (serverMonitorEnabled) {
-                serverMonitor.lastInput = input;
+                lastSimulationInput = input;
             }
 
             runRulesUpdate(input)
@@ -1035,7 +1036,7 @@ const server = http.createServer((request, response) => {
 
                     // update monitor last result
                     if (serverMonitorEnabled) {
-                        serverMonitor.lastResult = result;
+                        lastSimulationResult = result;
                     }
 
                     send(response, 200, JSON.stringify({...result, fps, frameStartTime, deviceCores }), {
@@ -1115,151 +1116,128 @@ function shutdown() {
     console.log(cpuUsageLog)
     reload = true;
 
-    // stop monitor and write CSV if enabled
-    try {
-        stopServerMonitor();
-        writeServerMonitorCSVOnExit();
-    } catch (e) {
-        console.warn('Error while flushing server monitor:', e);
+    // signal monitor worker to flush and exit
+    if (serverMonitorEnabled && monitorWorker) {
+        try {
+            monitorWorker.postMessage({type: 'shutdown', rootDir: root});
+        } catch (e) {
+            console.warn('Error signaling monitor worker:', e);
+        }
     }
 
     setTimeout(() => {
+        if (monitorWorker) {
+            try {
+                monitorWorker.terminate();
+            } catch (e) {
+                // ignore
+            }
+        }
         ruleWorkerPool.close();
         server.close(() => process.exit(0));
-    }, 1000);
+    }, 2000);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-let previousCpuUsage = process.cpuUsage();
-let previousTime = performance.now();
-
-function getProcessCpuUsagePercentage() {
-    const currentTime = performance.now();
-    const currentCpuUsage = process.cpuUsage(previousCpuUsage); // Gets the delta
-
-    // Convert millisecond time delta to microseconds to match process.cpuUsage
-    const timeDeltaMicroseconds = (currentTime - previousTime) * 1000;
-
-    // Total CPU time consumed by all threads (User + System space)
-    const totalCpuTimeUsed = currentCpuUsage.user + currentCpuUsage.system;
-
-    // Calculate percentage relative to a single core
-    const cpuPercentage = (totalCpuTimeUsed / timeDeltaMicroseconds) * 100;
-
-    // Reset baselines for the next check
-    previousCpuUsage = process.cpuUsage();
-    previousTime = currentTime;
-
-    return cpuPercentage; // Note: Can exceed 100% on multi-core systems
-}
-
 // Server-side monitoring (conditional on SERVER_MONITOR env var)
 const serverMonitorEnabled =
     (typeof process.env.SERVER_MONITOR !== 'undefined' && (process.env.SERVER_MONITOR === 'true' || process.env.SERVER_MONITOR === '1')) || false;
 
-const serverMonitor = {
-    samples: [],
-    intervalId: null,
-    lastInput: null,
-    lastResult: null,
-};
-
-function takeServerMonitorSample() {
-    const timestamp = new Date().toISOString();
-    const cpuUsage = getProcessCpuUsagePercentage();
-    const memory = process.memoryUsage();
-    const rss = memory.rss || 0; // bytes
-    const availableParallelism = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
-    const workerCount = ruleWorkerPool ? ruleWorkerPool.size : 0;
-    const threadCount = workerCount; // use worker pool size as thread count proxy
-
-    const numParticles = serverMonitor.lastInput ? (Array.isArray(serverMonitor.lastInput.atoms) ? serverMonitor.lastInput.atoms.length : 0) : (serverMonitor.lastResult && Array.isArray(serverMonitor.lastResult.atoms) ? serverMonitor.lastResult.atoms.length : 0);
-    const numColours = serverMonitor.lastInput ? Number(serverMonitor.lastInput.numColors || 0) : (serverMonitor.lastResult ? Number(serverMonitor.lastResult.numColors || 0) : 0);
-    const particlesPerColour = numColours > 0 ? Math.round(numParticles / numColours) : 0;
-    const totalParticles = numParticles;
-
-    // particles per thread: if lastInput had chunkedThreads true, compute using getParticleSetSize; otherwise derive default
-    let particlesPerThread = '';
-    if (serverMonitor.lastInput) {
-        try {
-            if (serverMonitor.lastInput.chunkedThreads) {
-                particlesPerThread = getParticleSetSize(serverMonitor.lastInput);
-            } else {
-                particlesPerThread = getDefaultParticleSetSize(serverMonitor.lastInput);
-            }
-        } catch (e) {
-            particlesPerThread = '';
-        }
-    }
-
-    serverMonitor.samples.push({
-        timestamp,
-        serverFps: serverFps || 0,
-        particlesPerThread,
-        threadCount,
-        workerCount,
-        cpuUsagePercent: Number(cpuUsage.toFixed(2)),
-        availableParallelism,
-        usedMemoryBytes: rss,
-        numParticles,
-        numColours,
-        particlesPerColour,
-        totalParticles,
-    });
-}
+let monitorWorker = null;
+let monitorIntervalId = null;
 
 function startServerMonitor() {
     if (!serverMonitorEnabled) return;
-    // sample once per second
-    serverMonitor.intervalId = setInterval(takeServerMonitorSample, 1000);
+    try {
+        const { Worker } = require('node:worker_threads');
+        monitorWorker = new Worker(path.join(root, 'server-monitor-worker.js'));
+
+        monitorWorker.on('error', (err) => {
+            console.warn('Monitor worker error:', err);
+        });
+
+        monitorWorker.on('exit', (code) => {
+            if (code !== 0 && !reload) {
+                console.warn('Monitor worker exited with code', code);
+            }
+            monitorWorker = null;
+        });
+
+        // send samples to worker every second
+        monitorIntervalId = setInterval(() => {
+            if (!monitorWorker || reload) return;
+
+            try {
+                const workerCount = ruleWorkerPool ? ruleWorkerPool.size : 0;
+                const threadCount = workerCount;
+
+                // compute particle data from last input/result if available
+                const numParticles = lastSimulationInput ? (Array.isArray(lastSimulationInput.atoms) ? lastSimulationInput.atoms.length : 0) : 0;
+                const numColours = lastSimulationInput ? Number(lastSimulationInput.numColors || 0) : 0;
+                const particlesPerColour = numColours > 0 ? Math.round(numParticles / numColours) : 0;
+
+                // particles per thread
+                let particlesPerThread = '';
+                if (lastSimulationInput) {
+                    try {
+                        if (lastSimulationInput.chunkedThreads) {
+                            particlesPerThread = getParticleSetSize(lastSimulationInput);
+                        } else {
+                            particlesPerThread = getDefaultParticleSetSize(lastSimulationInput);
+                        }
+                    } catch (e) {
+                        particlesPerThread = '';
+                    }
+                }
+
+                monitorWorker.postMessage({
+                    type: 'sample',
+                    data: {
+                        serverFps: serverFps || 0,
+                        particlesPerThread,
+                        threadCount,
+                        workerCount,
+                        numParticles,
+                        numColours,
+                        particlesPerColour,
+                        totalParticles: numParticles,
+                    }
+                });
+            } catch (e) {
+                console.warn('Error sending sample to monitor:', e.message);
+            }
+        }, 1000);
+    } catch (e) {
+        console.warn('Failed to start monitor worker:', e.message);
+    }
 }
 
 function stopServerMonitor() {
-    if (serverMonitor.intervalId) {
-        clearInterval(serverMonitor.intervalId);
-        serverMonitor.intervalId = null;
+    if (monitorIntervalId) {
+        clearInterval(monitorIntervalId);
+        monitorIntervalId = null;
     }
 }
 
-function writeServerMonitorCSVOnExit() {
-    if (!serverMonitorEnabled || !serverMonitor.samples.length) return;
-    try {
-        const dir = path.join(root, 'Server Performance Logs');
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, {recursive: true});
-        const filename = `server_performance_${Date.now()}.csv`;
-        const filepath = path.join(dir, filename);
-        const header = ['timestamp','server_fps','particles_per_thread','thread_count','worker_count','cpu_usage_percent','available_parallelism','used_memory_bytes','num_particles','num_colours','particles_per_colour','total_particles'].join(',') + '\n';
-        const lines = serverMonitor.samples.map(s => [s.timestamp, s.serverFps, s.particlesPerThread, s.threadCount, s.workerCount, s.cpuUsagePercent, s.availableParallelism, s.usedMemoryBytes, s.numParticles, s.numColours, s.particlesPerColour, s.totalParticles].join(','));
-        fs.writeFileSync(filepath, header + lines.join('\n'));
-        console.log('Server performance log written to', filepath);
-    } catch (e) {
-        console.warn('Failed to write server performance CSV:', e);
-    }
-}
+// track last simulation input/result for monitor
+let lastSimulationInput = null;
+let lastSimulationResult = null;
 
-// start monitor if enabled
-startServerMonitor();
-
-// Example: Check usage every 2 seconds
+// Display loop (non-blocking, no heavy CPU calculations)
 setInterval(async () => {
     if (reload !== true) {
         console.clear()
         console.log(`${stmes}\n`);
-        // readline.cursorTo(process.stdout, 0, process.stdout.rows - 1);
-        // readline.clearLine(process.stdout, 0);
 
-        const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
-
-        console.log(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | Available Parrallelism: ${os.availableParallelism()}`);
+        console.log(`  | Server FPS: ${serverFps} | Available Parallelism: ${os.availableParallelism()}`);
         console.log(process.pid)
-        // process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | TESTVAR: ${testVar}`);
-        cpuUsageLog.push(Number(cpuUsagePercentage))
+        cpuUsageLog.push(0); // placeholder since CPU is now monitored on worker thread
         log.push({
                 [testVar]:
                 serverFps
             }
         )
     }
-}, 1000);
+}, 2000);
