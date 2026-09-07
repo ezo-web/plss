@@ -2,6 +2,7 @@ const http = require("node:http");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+var connectedClients = []
 const readline = require('readline');
 const cpuUsageLog = [0.00]
 var serverFps
@@ -858,8 +859,16 @@ function getParticleSetSize(input) {
         : 100;
 }
 
+var testVar = 1
+setInterval(() => {
+    testVar += 1
+    if (testVar >= 50) {
+        testVar = 1;
+    }
+}, 1000);
+
 function getDefaultParticleSetSize(input) {
-    return Math.max(1, Math.ceil(input.atoms.length / ruleWorkerPool.size));
+    return Math.max(1, Math.ceil((input.atoms.length) / ruleWorkerPool.size));
 }
 
 function applyRulesChunkedOnServer(input) {
@@ -941,7 +950,7 @@ async function runRulesUpdate(input) {
     try {
         await Promise.race([
             gpuInitPromise,
-            new Promise((res) => setTimeout(res, 300)),
+            new Promise((res) => setTimeout(res, 3000)),
         ]);
     } catch (e) {
         // ignore init errors; detection below will fall back
@@ -1000,6 +1009,8 @@ function readJsonBody(request, callback) {
     request.on("error", (error) => callback(error));
 }
 
+var reload = false
+
 const server = http.createServer((request, response) => {
     if (request.method === "POST" && request.url === "/api/apply-rules") {
         readJsonBody(request, (error, input) => {
@@ -1012,11 +1023,22 @@ const server = http.createServer((request, response) => {
 
             const frameStartTime = performance.now();
 
+            // update monitor last input
+            if (serverMonitorEnabled) {
+                serverMonitor.lastInput = input;
+            }
+
             runRulesUpdate(input)
                 .then((result) => {
                     const fps = recordServerFps(performance.now() - frameStartTime);
                     serverFps = fps;
-                    send(response, 200, JSON.stringify({...result, fps, frameStartTime, deviceCores}), {
+
+                    // update monitor last result
+                    if (serverMonitorEnabled) {
+                        serverMonitor.lastResult = result;
+                    }
+
+                    send(response, 200, JSON.stringify({...result, fps, frameStartTime, deviceCores }), {
                         "Content-Type": "application/json; charset=utf-8",
                     });
                 })
@@ -1057,6 +1079,8 @@ const server = http.createServer((request, response) => {
     });
 });
 
+var stmes
+
 server.listen(port, HOST, () => {
     var startMessage
     if (Number(deviceCores) < 8) {
@@ -1078,14 +1102,31 @@ server.listen(port, HOST, () => {
         }
     }
 
+    stmes = startMessage;
     console.log(`${startMessage}`);
 });
 
+const log = []
+
 function shutdown() {
+    console.log(log);
+
     console.log(`\n\n| Complete log of CPU usage (%, oldest to newest):`)
     console.log(cpuUsageLog)
-    ruleWorkerPool.close();
-    server.close(() => process.exit(0));
+    reload = true;
+
+    // stop monitor and write CSV if enabled
+    try {
+        stopServerMonitor();
+        writeServerMonitorCSVOnExit();
+    } catch (e) {
+        console.warn('Error while flushing server monitor:', e);
+    }
+
+    setTimeout(() => {
+        ruleWorkerPool.close();
+        server.close(() => process.exit(0));
+    }, 1000);
 }
 
 process.on("SIGINT", shutdown);
@@ -1114,13 +1155,111 @@ function getProcessCpuUsagePercentage() {
     return cpuPercentage; // Note: Can exceed 100% on multi-core systems
 }
 
+// Server-side monitoring (conditional on SERVER_MONITOR env var)
+const serverMonitorEnabled =
+    (typeof process.env.SERVER_MONITOR !== 'undefined' && (process.env.SERVER_MONITOR === 'true' || process.env.SERVER_MONITOR === '1')) || false;
+
+const serverMonitor = {
+    samples: [],
+    intervalId: null,
+    lastInput: null,
+    lastResult: null,
+};
+
+function takeServerMonitorSample() {
+    const timestamp = new Date().toISOString();
+    const cpuUsage = getProcessCpuUsagePercentage();
+    const memory = process.memoryUsage();
+    const rss = memory.rss || 0; // bytes
+    const availableParallelism = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+    const workerCount = ruleWorkerPool ? ruleWorkerPool.size : 0;
+    const threadCount = workerCount; // use worker pool size as thread count proxy
+
+    const numParticles = serverMonitor.lastInput ? (Array.isArray(serverMonitor.lastInput.atoms) ? serverMonitor.lastInput.atoms.length : 0) : (serverMonitor.lastResult && Array.isArray(serverMonitor.lastResult.atoms) ? serverMonitor.lastResult.atoms.length : 0);
+    const numColours = serverMonitor.lastInput ? Number(serverMonitor.lastInput.numColors || 0) : (serverMonitor.lastResult ? Number(serverMonitor.lastResult.numColors || 0) : 0);
+    const particlesPerColour = numColours > 0 ? Math.round(numParticles / numColours) : 0;
+    const totalParticles = numParticles;
+
+    // particles per thread: if lastInput had chunkedThreads true, compute using getParticleSetSize; otherwise derive default
+    let particlesPerThread = '';
+    if (serverMonitor.lastInput) {
+        try {
+            if (serverMonitor.lastInput.chunkedThreads) {
+                particlesPerThread = getParticleSetSize(serverMonitor.lastInput);
+            } else {
+                particlesPerThread = getDefaultParticleSetSize(serverMonitor.lastInput);
+            }
+        } catch (e) {
+            particlesPerThread = '';
+        }
+    }
+
+    serverMonitor.samples.push({
+        timestamp,
+        serverFps: serverFps || 0,
+        particlesPerThread,
+        threadCount,
+        workerCount,
+        cpuUsagePercent: Number(cpuUsage.toFixed(2)),
+        availableParallelism,
+        usedMemoryBytes: rss,
+        numParticles,
+        numColours,
+        particlesPerColour,
+        totalParticles,
+    });
+}
+
+function startServerMonitor() {
+    if (!serverMonitorEnabled) return;
+    // sample once per second
+    serverMonitor.intervalId = setInterval(takeServerMonitorSample, 1000);
+}
+
+function stopServerMonitor() {
+    if (serverMonitor.intervalId) {
+        clearInterval(serverMonitor.intervalId);
+        serverMonitor.intervalId = null;
+    }
+}
+
+function writeServerMonitorCSVOnExit() {
+    if (!serverMonitorEnabled || !serverMonitor.samples.length) return;
+    try {
+        const dir = path.join(root, 'Server Performance Logs');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, {recursive: true});
+        const filename = `server_performance_${Date.now()}.csv`;
+        const filepath = path.join(dir, filename);
+        const header = ['timestamp','server_fps','particles_per_thread','thread_count','worker_count','cpu_usage_percent','available_parallelism','used_memory_bytes','num_particles','num_colours','particles_per_colour','total_particles'].join(',') + '\n';
+        const lines = serverMonitor.samples.map(s => [s.timestamp, s.serverFps, s.particlesPerThread, s.threadCount, s.workerCount, s.cpuUsagePercent, s.availableParallelism, s.usedMemoryBytes, s.numParticles, s.numColours, s.particlesPerColour, s.totalParticles].join(','));
+        fs.writeFileSync(filepath, header + lines.join('\n'));
+        console.log('Server performance log written to', filepath);
+    } catch (e) {
+        console.warn('Failed to write server performance CSV:', e);
+    }
+}
+
+// start monitor if enabled
+startServerMonitor();
+
 // Example: Check usage every 2 seconds
 setInterval(async () => {
-    readline.cursorTo(process.stdout, 0, process.stdout.rows - 1);
-    readline.clearLine(process.stdout, 0);
+    if (reload !== true) {
+        console.clear()
+        console.log(`${stmes}\n`);
+        // readline.cursorTo(process.stdout, 0, process.stdout.rows - 1);
+        // readline.clearLine(process.stdout, 0);
 
-    const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
+        const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
 
-    process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} |`);
-    cpuUsageLog.push(Number(cpuUsagePercentage))
+        console.log(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | Available Parrallelism: ${os.availableParallelism()}`);
+        console.log(process.pid)
+        // process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | TESTVAR: ${testVar}`);
+        cpuUsageLog.push(Number(cpuUsagePercentage))
+        log.push({
+                [testVar]:
+                serverFps
+            }
+        )
+    }
 }, 1000);
