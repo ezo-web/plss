@@ -28,6 +28,7 @@ const predefinedColors = [
 ];
 const settings = {
     deviceCoreCount: 0,
+    advancedMode: false,
     seed: 91651088029,
     fps: 0,
     clientFps: 0,
@@ -68,6 +69,7 @@ const settings = {
     smartChunking: false,
     particleSetSize: 50,
     rules: {},
+    usage: "",
     rulesArray: [],
     radii: {},
     radii2Array: [],
@@ -92,6 +94,9 @@ const settings = {
         symmetricRules();
         randomAtoms(settings.atoms.count, true);
         updateGUIDisplay();
+    },
+    shutdown: () => {
+        fetch("http://localhost:8001/api/shutdown")
     },
     gui: null,
 };
@@ -149,9 +154,9 @@ const smartChunking = {
     bestFps: 0,
     bestSize: 100,
     lastCandidateSize: 100,
-    framesPerSample: 10, // collect 50 frames per sample
-    maxSearchRounds: 7, // run 7 rounds of evaluation
-    improvementRatio: 0.2, // require 20% improvement to keep a new candidate size
+    framesPerSample: 20, // collect 20 frames per sample
+    maxSearchRounds: 14, // run 7 rounds of evaluation
+    improvementRatio: 0.1, // require 20% improvement to keep a new candidate size
     // results: array of rounds { phase, sizes: [...], fps: [...] }
     results: [],
     currentRoundIndex: -1,
@@ -390,6 +395,7 @@ const setupGUI = (async () => {
     configFolder.add(settings, "reset").name("Reset");
     configFolder.add(settings, "randomRules").name("Random Rules");
     configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
+    configFolder.add(settings, "shutdown").name("Shutdown");
     configFolder
         .add(settings, "numColors", 1, 19, 1)
         .name("Number of Colors")
@@ -415,6 +421,7 @@ const setupGUI = (async () => {
     configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
     configFolder.add(settings, "commonFps").name("FPS - (Common)").listen().disable();
     configFolder.add(settings, "framesThisSecond").name("Frames This Seconds").listen().disable();
+    configFolder.add(settings, "usage").name("CPU Usage (%)").listen().disable();
     configFolder.add(settings, "totv").name("Total V").listen().disable();
     configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
     configFolder
@@ -457,7 +464,7 @@ const setupGUI = (async () => {
         .name("Wall Repel")
         .listen();
     configFolder.add(settings, "explore").name("Random Mutations").listen();
-    setTimeout(async() => {if (await settings.deviceCoreCount >= 8) {
+    setTimeout(async() => {if ( await settings.deviceCoreCount >= 8 ) {
         configFolder
             .add(settings, "chunkedThreads")
             .name("Fine Threading")
@@ -476,7 +483,7 @@ const setupGUI = (async () => {
             invalidateServerStep();
         });
     particleSetSizeController = configFolder
-        .add(settings, "particleSetSize", 20, 4000, 5)
+        .add(settings, "particleSetSize", 20, 4000, 1)
         .name("Particles per Thread")
         .listen()
         .onFinishChange((v) => {
@@ -591,6 +598,10 @@ function flattenRules() {
     invalidateServerStep();
 }
 
+function shutdown() {
+    fetch("https://localhost:8001/api/shutdown")
+}
+
 function updateCanvasDimensions() {
     const nextWidth = window.innerWidth * 0.9;
     const nextHeight = window.innerHeight * 0.9;
@@ -660,6 +671,104 @@ let serverStepInFlight = false;
 let serverStepFailed = false;
 let lineWarningShown = false;
 let simulationVersion = 0;
+const applyRulesRequestHeaderBytes = 88;
+const applyRulesResponseHeaderBytes = 32;
+
+function buildApplyRulesRequestBuffer() {
+    const atomCount = atoms.length;
+    const ruleCount = settings.rulesArray.length;
+    const radiiCount = settings.radii2Array.length;
+    const buffer = new ArrayBuffer(
+        applyRulesRequestHeaderBytes +
+            (atomCount * 5 + ruleCount + radiiCount) * Float64Array.BYTES_PER_ELEMENT,
+    );
+    const view = new DataView(buffer);
+    let offset = 0;
+
+    view.setUint32(offset, atomCount, true);
+    offset += 4;
+    view.setUint32(offset, settings.numColors, true);
+    offset += 4;
+    view.setFloat64(offset, pulse, true);
+    offset += 8;
+    view.setFloat64(offset, pulse_x, true);
+    offset += 8;
+    view.setFloat64(offset, pulse_y, true);
+    offset += 8;
+    view.setFloat64(offset, settings.force_scale, true);
+    offset += 8;
+    view.setFloat64(offset, settings.wallRepel, true);
+    offset += 8;
+    view.setFloat64(offset, canvas.width, true);
+    offset += 8;
+    view.setFloat64(offset, canvas.height, true);
+    offset += 8;
+    view.setFloat64(offset, settings.gravity, true);
+    offset += 8;
+    view.setFloat64(offset, settings.viscosity, true);
+    offset += 8;
+    view.setUint8(offset, settings.chunkedThreads ? 1 : 0);
+    offset += 1;
+    view.setUint8(offset, 0);
+    view.setUint8(offset + 1, 0);
+    view.setUint8(offset + 2, 0);
+    offset += 3;
+    view.setUint32(offset, settings.particleSetSize, true);
+    offset += 4;
+
+    const atomsView = new Float64Array(buffer, offset, atomCount * 5);
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        const atom = atoms[i];
+        atomsView[atomOffset] = atom[0];
+        atomsView[atomOffset + 1] = atom[1];
+        atomsView[atomOffset + 2] = atom[2];
+        atomsView[atomOffset + 3] = atom[3];
+        atomsView[atomOffset + 4] = atom[4];
+        atomOffset += 5;
+    }
+    offset += atomCount * 5 * Float64Array.BYTES_PER_ELEMENT;
+
+    new Float64Array(buffer, offset, ruleCount).set(settings.rulesArray);
+    offset += ruleCount * Float64Array.BYTES_PER_ELEMENT;
+    new Float64Array(buffer, offset, radiiCount).set(settings.radii2Array);
+
+    return buffer;
+}
+
+function decodeApplyRulesResponse(buffer) {
+    if (buffer.byteLength < applyRulesResponseHeaderBytes) {
+        throw new Error("Invalid binary response");
+    }
+    const view = new DataView(buffer);
+    let offset = 0;
+    const atomCount = view.getUint32(offset, true);
+    offset += 4;
+    const deviceCores = view.getUint32(offset, true);
+    offset += 4;
+    const fps = view.getFloat64(offset, true);
+    offset += 8;
+    const totalV = view.getFloat64(offset, true);
+    offset += 8;
+    const usage = view.getFloat64(offset, true);
+    offset += 8;
+
+    const atoms = new Array(atomCount);
+    const atomsView = new Float64Array(buffer, offset, atomCount * 5);
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        atoms[i] = [
+            atomsView[atomOffset],
+            atomsView[atomOffset + 1],
+            atomsView[atomOffset + 2],
+            atomsView[atomOffset + 3],
+            atomsView[atomOffset + 4],
+        ];
+        atomOffset += 5;
+    }
+
+    return {atoms, fps, totalV, deviceCores, usage};
+}
 
 function invalidateServerStep() {
     simulationVersion += 1;
@@ -683,29 +792,17 @@ function applyRulesOnServer() {
 
     if (!settings.paused == true) {
         serverStepInFlight = true;
-        var lastT = Date.now();
+        const requestBody = buildApplyRulesRequestBuffer();
         fetch("/api/apply-rules", {
             method: "POST",
-            headers: {"Content-Type": "application/json", "Connection": "keep-alive"},
-            body: JSON.stringify({
-                atoms,
-                rulesArray: settings.rulesArray,
-                radii2Array: settings.radii2Array,
-                numColors: settings.numColors,
-                pulse,
-                pulseX: pulse_x,
-                pulseY: pulse_y,
-                forceScale: settings.force_scale,
-                wallRepel: settings.wallRepel,
-                canvasWidth: canvas.width,
-                canvasHeight: canvas.height,
-                gravity: settings.gravity,
-                viscosity: settings.viscosity,
-                chunkedThreads: settings.chunkedThreads,
-                particleSetSize: settings.particleSetSize,
-            }),
+            cache: "no-store",
+            headers: {
+                "Content-Type": "application/octet-stream",
+                Accept: "application/octet-stream",
+            },
+            body: requestBody,
         })
-            .then((response) => {
+            .then(async (response) => {
                 const roundTripMs = performance.now() - requestStartedAt;
                 if (roundTripMs > 0) {
                     const newFps = 1000 / roundTripMs;
@@ -715,6 +812,10 @@ function applyRulesOnServer() {
                 }
                 if (!response.ok)
                     throw new Error(`Server applyRules failed: ${response.status}`);
+                const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+                if (contentType.includes("application/octet-stream")) {
+                    return decodeApplyRulesResponse(await response.arrayBuffer());
+                }
                 return response.json();
             })
             .then((result) => {
@@ -722,6 +823,7 @@ function applyRulesOnServer() {
                 total_v = result.totalV;
                 settings.totv = Math.round(result.totalV * 10) / 10;
                 settings.fps = result.fps;
+                settings.usage = result.usage;
                 settings.atomCount = result.atoms.length;
                 if (numberOfRequests === 0) {
                 settings.deviceCoreCount = result.deviceCores;

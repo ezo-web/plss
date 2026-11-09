@@ -4,6 +4,7 @@ const os = require("node:os");
 var monitorRounds = 0
 const path = require("node:path");
 var connectedClients = []
+const { $ } = require("bun");
 const readline = require('readline');
 const cpuUsageLog = [0.00]
 var serverFps
@@ -23,13 +24,15 @@ const deviceCores = cpuDetails.length;
 const cpuModel = cpuDetails[0].model;
 const cpuMHz = cpuDetails[0].speed
 const wasmPath = isMainThread
-    ? path.join(root, "rule-worker.wasm")
+    ? path.join(root, "stripped.wasm")
     : workerData.wasmPath;
 const wasmNumberType = 1;
 const wasmPageBytes = 65536;
 const wasmScratchOffset = 4096;
 const atomValueCount = 5;
 const atomByteStride = atomValueCount * Float64Array.BYTES_PER_ELEMENT;
+const applyRulesRequestHeaderBytes = 88;
+const applyRulesResponseHeaderBytes = 32;
 const mode = process.env.MODE;
 const maxRequestBytes = 20 * 1024 * 1024;
 let smoothedServerFps = 0;
@@ -59,7 +62,7 @@ if (wasmBytes) {
     rulesWasmF64 = new Float64Array(rulesWasm.$.buffer);
 }
 
-// Attempt to initialize WebGPU on the server (node). Prefer @webgpu/wgpu but fall back gracefully.
+// Attempt to initialize WebGPU on the server2 (node). Prefer @webgpu/wgpu but fall back gracefully.
 let gpuAvailable = false;
 let gpuDevice = null;
 let gpuAdapter = null;
@@ -106,7 +109,7 @@ async function initWebGPU() {
             if (gpuDevice) {
                 gpuAvailable = true;
                 gpuBackend = nodeGpu;
-                console.log('WebGPU initialized for server-side rule computation.');
+                console.log('WebGPU initialized for server2-side rule computation.');
             }
         } catch (err) {
             console.warn('WebGPU initialization failed, falling back to WASM/CPU path:', err && err.message ? err.message : err);
@@ -989,32 +992,165 @@ function recordServerFps(frameDurationMs) {
     return Math.round(smoothedServerFps);
 }
 
-function readJsonBody(request, callback) {
-    let body = "";
+function readRequestBody(request, callback) {
+    const chunks = [];
+    let totalLength = 0;
 
     request.on("data", (chunk) => {
-        body += chunk;
-        if (body.length > maxRequestBytes) {
+        chunks.push(chunk);
+        totalLength += chunk.length;
+        if (totalLength > maxRequestBytes) {
             request.destroy();
         }
     });
 
     request.on("end", () => {
-        try {
-            callback(null, JSON.parse(body));
-        } catch (error) {
-            callback(error);
-        }
+        callback(null, Buffer.concat(chunks));
     });
 
     request.on("error", (error) => callback(error));
 }
 
-var reload = false
+function parseApplyRulesBody(request, body) {
+    const contentType = String(request.headers["content-type"] || "").toLowerCase();
+    if (contentType.includes("application/json")) {
+        return JSON.parse(body.toString("utf8"));
+    }
 
-const server = http.createServer((request, response) => {
+    const view = new DataView(body.buffer, body.byteOffset, body.byteLength);
+    let offset = 0;
+    const atomCount = view.getUint32(offset, true);
+    offset += 4;
+    const numColors = view.getUint32(offset, true);
+    offset += 4;
+    const pulse = view.getFloat64(offset, true);
+    offset += 8;
+    const pulseX = view.getFloat64(offset, true);
+    offset += 8;
+    const pulseY = view.getFloat64(offset, true);
+    offset += 8;
+    const forceScale = view.getFloat64(offset, true);
+    offset += 8;
+    const wallRepel = view.getFloat64(offset, true);
+    offset += 8;
+    const canvasWidth = view.getFloat64(offset, true);
+    offset += 8;
+    const canvasHeight = view.getFloat64(offset, true);
+    offset += 8;
+    const gravity = view.getFloat64(offset, true);
+    offset += 8;
+    const viscosity = view.getFloat64(offset, true);
+    offset += 8;
+    const chunkedThreads = view.getUint8(offset) === 1;
+    offset += 4;
+    const particleSetSize = view.getUint32(offset, true);
+    offset += 4;
+
+    const atomsLength = atomCount * atomValueCount;
+    const rulesLength = numColors * numColors;
+    const radiiLength = numColors;
+    const atomsBytes = atomsLength * Float64Array.BYTES_PER_ELEMENT;
+    const rulesBytes = rulesLength * Float64Array.BYTES_PER_ELEMENT;
+    const radiiBytes = radiiLength * Float64Array.BYTES_PER_ELEMENT;
+    const expectedBytes = applyRulesRequestHeaderBytes + atomsBytes + rulesBytes + radiiBytes;
+
+    if (body.byteLength !== expectedBytes) {
+        throw new Error(
+            `Invalid binary payload length: expected ${expectedBytes}, received ${body.byteLength}`,
+        );
+    }
+
+    const atoms = new Array(atomCount);
+    const atomsView = new Float64Array(
+        body.buffer,
+        body.byteOffset + offset,
+        atomsLength,
+    );
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        atoms[i] = [
+            atomsView[atomOffset],
+            atomsView[atomOffset + 1],
+            atomsView[atomOffset + 2],
+            atomsView[atomOffset + 3],
+            atomsView[atomOffset + 4],
+        ];
+        atomOffset += atomValueCount;
+    }
+    offset += atomsBytes;
+
+    const rulesArray = new Float64Array(
+        body.buffer,
+        body.byteOffset + offset,
+        rulesLength,
+    );
+    offset += rulesBytes;
+    const radii2Array = new Float64Array(
+        body.buffer,
+        body.byteOffset + offset,
+        radiiLength,
+    );
+
+    return {
+        atoms,
+        rulesArray,
+        radii2Array,
+        numColors,
+        pulse,
+        pulseX,
+        pulseY,
+        forceScale,
+        wallRepel,
+        canvasWidth,
+        canvasHeight,
+        gravity,
+        viscosity,
+        chunkedThreads,
+        particleSetSize,
+    };
+}
+
+function encodeApplyRulesBinaryResponse(result, fps, deviceCores, usage) {
+    const atomCount = result.atoms.length;
+    const atomsBytes = atomCount * atomValueCount * Float64Array.BYTES_PER_ELEMENT;
+    const totalBytes = applyRulesResponseHeaderBytes + atomsBytes;
+    const buffer = new ArrayBuffer(totalBytes);
+    const view = new DataView(buffer);
+    let offset = 0;
+
+    view.setUint32(offset, atomCount, true);
+    offset += 4;
+    view.setUint32(offset, deviceCores, true);
+    offset += 4;
+    view.setFloat64(offset, fps, true);
+    offset += 8;
+    view.setFloat64(offset, result.totalV, true);
+    offset += 8;
+    view.setFloat64(offset, usage, true);
+    offset += 8;
+
+    const atomsView = new Float64Array(buffer, offset, atomCount * atomValueCount);
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        const atom = result.atoms[i];
+        atomsView[atomOffset] = atom[0];
+        atomsView[atomOffset + 1] = atom[1];
+        atomsView[atomOffset + 2] = atom[2];
+        atomsView[atomOffset + 3] = atom[3];
+        atomsView[atomOffset + 4] = atom[4];
+        atomOffset += atomValueCount;
+    }
+
+    return Buffer.from(buffer);
+}
+
+var reload = false
+var usage
+var frameDuration
+
+const server2 = http.createServer((request, response) => {
     if (request.method === "POST" && request.url === "/api/apply-rules") {
-        readJsonBody(request, (error, input) => {
+        readRequestBody(request, (error, body) => {
             if (error) {
                 send(response, 400, JSON.stringify({error: "Invalid JSON body"}), {
                     "Content-Type": "application/json; charset=utf-8",
@@ -1022,26 +1158,66 @@ const server = http.createServer((request, response) => {
                 return;
             }
 
+            let input;
+            let binaryResponse = false;
+            try {
+                input = parseApplyRulesBody(request, body);
+                binaryResponse = !String(request.headers["content-type"] || "")
+                    .toLowerCase()
+                    .includes("application/json");
+            } catch (parseError) {
+                send(
+                    response,
+                    400,
+                    JSON.stringify({
+                        error: parseError instanceof Error ? parseError.message : "Invalid request body",
+                    }),
+                    {
+                        "Content-Type": "application/json; charset=utf-8",
+                    },
+                );
+                return;
+            }
+
             const frameStartTime = performance.now();
 
             // update monitor last input
             if (serverMonitorEnabled) {
-                lastSimulationInput = input;
+                serverMonitor.lastInput = input;
             }
 
             runRulesUpdate(input)
                 .then((result) => {
                     const fps = recordServerFps(performance.now() - frameStartTime);
+                    frameDuration = performance.now() - frameStartTime
                     serverFps = fps;
+                    usage = getProcessCpuUsagePercentage().toFixed(2);;
 
                     // update monitor last result
                     if (serverMonitorEnabled) {
-                        lastSimulationResult = result;
+                        serverMonitor.lastResult = result;
                     }
 
-                    send(response, 200, JSON.stringify({...result, fps, frameStartTime, deviceCores }), {
-                        "Content-Type": "application/json; charset=utf-8",
-                    });
+                    if (binaryResponse) {
+                        send(
+                            response,
+                            200,
+                            encodeApplyRulesBinaryResponse(result, fps, deviceCores, usage, frameDuration),
+                            {
+                                "Content-Type": "application/octet-stream",
+                            },
+                        );
+                        return;
+                    }
+
+                    send(
+                        response,
+                        200,
+                        JSON.stringify({...result, fps, frameStartTime, deviceCores, usage, frameDuration}),
+                        {
+                            "Content-Type": "application/json; charset=utf-8",
+                        },
+                    );
                 })
                 .catch((applyError) => {
                     console.error(applyError);
@@ -1054,6 +1230,23 @@ const server = http.createServer((request, response) => {
                         },
                     );
                 });
+        });
+        return;
+    }
+
+    if (request.url === "/api/get-usage") {
+        readJsonBody(request, (error, input) => {
+            if (error) {
+                send(response, 400, JSON.stringify({error: "Invalid JSON body"}), {
+                    "Content-Type": "application/json; charset=utf-8",
+                });
+                return;
+            } else {
+                send(response, 200, JSON.stringify({usage: getProcessCpuUsagePercentage()}), {
+                    "Content-Type": "application/json; charset=utf-8",
+                });
+                return;
+            }
         });
         return;
     }
@@ -1082,7 +1275,7 @@ const server = http.createServer((request, response) => {
 
 var stmes
 
-server.listen(port, HOST, () => {
+server2.listen(port, HOST, () => {
     var startMessage
     if (Number(deviceCores) < 8) {
         startMessage = `[WARNING] YOUR DEVICE DOES NOT MEET THE RECOMMENDED HARDWARE REQUIREMENTS TO RUN PLSS. PROCEED WITH CAUTION AND DO NOT USE MORE THAN 2500 PARTICLES IN YOUR SIMULATION.`
@@ -1109,135 +1302,161 @@ server.listen(port, HOST, () => {
 
 const log = []
 
-function shutdown() {
-    console.log(log);
-
-    console.log(`\n\n| Complete log of CPU usage (%, oldest to newest):`)
-    console.log(cpuUsageLog)
+async function shutdown() {
+    console.clear()
+    console.log("[SHUTTING DOWN GRACEFULLY]")
     reload = true;
 
-    // signal monitor worker to flush and exit
-    if (serverMonitorEnabled && monitorWorker) {
-        try {
-            monitorWorker.postMessage({type: 'shutdown', rootDir: root});
-        } catch (e) {
-            console.warn('Error signaling monitor worker:', e);
-        }
+    // stop monitor and write CSV if enabled
+    try {
+        stopServerMonitor();
+        writeServerMonitorCSVOnExit();
+    } catch (e) {
+        console.warn('Error while flushing server2 monitor:', e);
     }
 
     setTimeout(() => {
-        if (monitorWorker) {
-            try {
-                monitorWorker.terminate();
-            } catch (e) {
-                // ignore
-            }
-        }
         ruleWorkerPool.close();
-        server.close(() => process.exit(0));
-    }, 2000);
+        console.clear()
+        $`kill -9 $(lsof -ti:8001)`;
+        server2.close(() => process.exit(0));
+    }, 1000);
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-// Server-side monitoring (conditional on SERVER_MONITOR env var)
-const serverMonitorEnabled =
-    (typeof process.env.SERVER_MONITOR !== 'undefined' && (process.env.SERVER_MONITOR === 'true' || process.env.SERVER_MONITOR === '1')) || false;
+let previousCpuUsage = process.cpuUsage();
+let previousTime = performance.now();
 
-let monitorWorker = null;
-let monitorIntervalId = null;
+function getProcessCpuUsagePercentage() {
+    const currentTime = performance.now();
+    const currentCpuUsage = process.cpuUsage(previousCpuUsage); // Gets the delta
+
+    // Convert millisecond time delta to microseconds to match process.cpuUsage
+    const timeDeltaMicroseconds = (currentTime - previousTime) * 1000;
+
+    // Total CPU time consumed by all threads (User + System space)
+    const totalCpuTimeUsed = currentCpuUsage.user + currentCpuUsage.system;
+
+    // Calculate percentage relative to a single core
+    const cpuPercentage = (totalCpuTimeUsed / timeDeltaMicroseconds) * 100;
+
+    // Reset baselines for the next check
+    previousCpuUsage = process.cpuUsage();
+    previousTime = currentTime;
+
+    return cpuPercentage; // Note: Can exceed 100% on multi-core systems
+}
+
+// Server-side monitoring (conditional on SERVER_MONITOR env var)
+const serverMonitorEnabled = (typeof process.env.SERVER_MONITOR !== 'undefined' && (process.env.SERVER_MONITOR === 'true' || process.env.SERVER_MONITOR === '1')) || false;
+
+const serverMonitor = {
+    samples: [],
+    intervalId: null,
+    lastInput: null,
+    lastResult: null,
+};
+
+function takeServerMonitorSample() {
+    const timestamp = new Date().toISOString();
+    const monitorRound = monitorRounds
+    const cpuUsage = getProcessCpuUsagePercentage();
+    const memory = process.memoryUsage();
+    const rss = memory.rss || 0; // bytes
+    const availableParallelism = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+    const workerCount = ruleWorkerPool ? ruleWorkerPool.size : 0;
+    const threadCount = workerCount; // use worker pool size as thread count proxy
+
+    const numParticles = serverMonitor.lastInput ? (Array.isArray(serverMonitor.lastInput.atoms) ? serverMonitor.lastInput.atoms.length : 0) : (serverMonitor.lastResult && Array.isArray(serverMonitor.lastResult.atoms) ? serverMonitor.lastResult.atoms.length : 0);
+    const numColours = serverMonitor.lastInput ? Number(serverMonitor.lastInput.numColors || 0) : (serverMonitor.lastResult ? Number(serverMonitor.lastResult.numColors || 0) : 0);
+    const particlesPerColour = numColours > 0 ? Math.round(numParticles / numColours) : 0;
+    const totalParticles = numParticles;
+
+    // particles per thread: if lastInput had chunkedThreads true, compute using getParticleSetSize; otherwise derive default
+    let particlesPerThread = '';
+    if (serverMonitor.lastInput) {
+        try {
+            if (serverMonitor.lastInput.chunkedThreads) {
+                particlesPerThread = getParticleSetSize(serverMonitor.lastInput);
+            } else {
+                particlesPerThread = getDefaultParticleSetSize(serverMonitor.lastInput);
+            }
+        } catch (e) {
+            particlesPerThread = '';
+        }
+    }
+
+    serverMonitor.samples.push({
+        timestamp,
+        monitorRound,
+        serverFps: serverFps || 0,
+        particlesPerThread,
+        threadCount,
+        workerCount,
+        cpuUsagePercent: Number(cpuUsage.toFixed(2)),
+        availableParallelism,
+        usedMemoryBytes: rss,
+        numParticles,
+        numColours,
+        particlesPerColour,
+        totalParticles,
+    });
+    monitorRounds += 1;
+}
 
 function startServerMonitor() {
     if (!serverMonitorEnabled) return;
-    try {
-        const { Worker } = require('node:worker_threads');
-        monitorWorker = new Worker(path.join(root, 'server-monitor-worker.js'));
-
-        monitorWorker.on('error', (err) => {
-            console.warn('Monitor worker error:', err);
-        });
-
-        monitorWorker.on('exit', (code) => {
-            if (code !== 0 && !reload) {
-                console.warn('Monitor worker exited with code', code);
-            }
-            monitorWorker = null;
-        });
-
-        // send samples to worker every second
-        monitorIntervalId = setInterval(() => {
-            if (!monitorWorker || reload) return;
-
-            try {
-                const workerCount = ruleWorkerPool ? ruleWorkerPool.size : 0;
-                const threadCount = workerCount;
-
-                // compute particle data from last input/result if available
-                const numParticles = lastSimulationInput ? (Array.isArray(lastSimulationInput.atoms) ? lastSimulationInput.atoms.length : 0) : 0;
-                const numColours = lastSimulationInput ? Number(lastSimulationInput.numColors || 0) : 0;
-                const particlesPerColour = numColours > 0 ? Math.round(numParticles / numColours) : 0;
-
-                // particles per thread
-                let particlesPerThread = '';
-                if (lastSimulationInput) {
-                    try {
-                        if (lastSimulationInput.chunkedThreads) {
-                            particlesPerThread = getParticleSetSize(lastSimulationInput);
-                        } else {
-                            particlesPerThread = getDefaultParticleSetSize(lastSimulationInput);
-                        }
-                    } catch (e) {
-                        particlesPerThread = '';
-                    }
-                }
-
-                monitorWorker.postMessage({
-                    type: 'sample',
-                    data: {
-                        serverFps: serverFps || 0,
-                        particlesPerThread,
-                        threadCount,
-                        workerCount,
-                        numParticles,
-                        numColours,
-                        particlesPerColour,
-                        totalParticles: numParticles,
-                    }
-                });
-            } catch (e) {
-                console.warn('Error sending sample to monitor:', e.message);
-            }
-        }, 1000);
-    } catch (e) {
-        console.warn('Failed to start monitor worker:', e.message);
-    }
+    // sample once per second
+    serverMonitor.intervalId = setInterval(takeServerMonitorSample, 100);
 }
 
 function stopServerMonitor() {
-    if (monitorIntervalId) {
-        clearInterval(monitorIntervalId);
-        monitorIntervalId = null;
+    if (serverMonitor.intervalId) {
+        clearInterval(serverMonitor.intervalId);
+        serverMonitor.intervalId = null;
     }
 }
 
-// track last simulation input/result for monitor
-let lastSimulationInput = null;
-let lastSimulationResult = null;
+function writeServerMonitorCSVOnExit() {
+    if (!serverMonitorEnabled || !serverMonitor.samples.length) return;
+    try {
+        const dir = path.join(root, 'Server Performance Logs');
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, {recursive: true});
+        const filename = `server_performance_${Date.now()}.csv`;
+        const filepath = path.join(dir, filename);
+        const header = ['timestamp', 'sampling_round', 'server_fps', 'particles_per_thread', 'thread_count', 'worker_count', 'cpu_usage_percent', 'available_parallelism', 'used_memory_bytes', 'num_particles', 'num_colours', 'particles_per_colour', 'total_particles'].join(',') + '\n';
+        const lines = serverMonitor.samples.map(s => [s.timestamp, s.monitorRound, s.serverFps, s.particlesPerThread, s.threadCount, s.workerCount, s.cpuUsagePercent, s.availableParallelism, s.usedMemoryBytes, s.numParticles, s.numColours, s.particlesPerColour, s.totalParticles].join(','));
+        fs.writeFileSync(filepath, header + lines.join('\n'));
+        console.log('Server performance log written to', filepath);
+    } catch (e) {
+        console.warn('Failed to write server2 performance CSV:', e);
+    }
+}
 
-// Display loop (non-blocking, no heavy CPU calculations)
+// start monitor if enabled
+startServerMonitor();
+
+// Example: Check usage every 2 seconds
 setInterval(async () => {
     if (reload !== true) {
         console.clear()
-        console.log(`${stmes}\n`);
+        console.log(`PLSS System Controller${os.EOL}----------------------`)
+        console.log(`| Processor: ${cpuModel} | CPU Cores: ${deviceCores} | CPU Clock Speed: ${cpuMHz} | Available Parallelism: ${os.availableParallelism} |\n\n${os.EOL}PLSS is ready. Run "/help" to list available commands.`)
+        console.log(`${stmes}\n`)
+        // readline.cursorTo(process.stdout, 0, process.stdout.rows - 1);
+        // readline.clearLine(process.stdout, 0);
 
-        console.log(`  | Server FPS: ${serverFps} | Available Parallelism: ${os.availableParallelism()}`);
-        console.log(process.pid)
-        cpuUsageLog.push(0); // placeholder since CPU is now monitored on worker thread
+        const cpuUsagePercentage = getProcessCpuUsagePercentage().toFixed(2);
+
+        console.log(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | Available Parallelism: ${os.availableParallelism()} | Frame Duration: ${frameDuration} | CTRLPID: ${process.env.CTRLR}`);
+        // process.stdout.write(`  | Total CPU Usage: ${cpuUsagePercentage}% | Server FPS: ${serverFps} | TESTVAR: ${testVar}`);
+        cpuUsageLog.push(Number(cpuUsagePercentage))
         log.push({
                 [testVar]:
                 serverFps
             }
         )
     }
-}, 2000);
+}, 1000);
