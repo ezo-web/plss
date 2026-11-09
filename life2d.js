@@ -1,544 +1,626 @@
 const maxRadius = 200;
+const maxRadiusSquared = maxRadius * maxRadius;
 const maxClusters = 50;
 const minClusterSize = 10;
 const minSmartParticleSetSize = 20;
+const clientId = Math.floor(Math.random() * (5000 - 1000 + 1)) + 1000;
+console.log(clientId);
 const predefinedColors = [
-  "green",
-  "red",
-  "orange",
-  "cyan",
-  "magenta",
-  "lavender",
-  "teal",
-  "yellow",
-  "blue",
-  "white",
-  "lime",
-  "purple",
-  "pink",
-  "brown",
-  "coral",
-  "gold",
-  "silver",
-  "maroon",
-  "navy",
+    "green",
+    "red",
+    "orange",
+    "cyan",
+    "magenta",
+    "lavender",
+    "teal",
+    "yellow",
+    "blue",
+    "white",
+    "lime",
+    "purple",
+    "pink",
+    "brown",
+    "coral",
+    "gold",
+    "silver",
+    "maroon",
+    "navy",
 ];
 const settings = {
-  seed: 91651088029,
-  fps: 0,
-  atoms: {
-    count: 500, // Per Color
-    radius: 1,
-  },
-  drawings: {
-    // Drawing options can be expensive on performance
-    lines: false, // draw lines between atoms that arr effecting each other
-    circle: false, // draw atoms as circles
-    clusters: false,
-    background_color: "#000000", // Background color
-  },
-  export: {
-    // Export a Screenshot image
-    image: () => {
-      const imageDataURL = canvas.toDataURL({
-        format: "png",
-        quality: 1,
-      });
-      dataURL_downloader(imageDataURL);
+    deviceCoreCount: 0,
+    advancedMode: false,
+    seed: 91651088029,
+    fps: 0,
+    clientFps: 0,
+    commonFps: 0,
+    totv: 0,
+    framesThisSecond: 0,
+    atomCount: 0,
+    atoms: {
+        count: 500, // Per Color
+        radius: 1,
     },
-    // Export a video recording
-    video: () => {
-      mediaRecorder.state == "recording"
-        ? mediaRecorder.stop()
-        : mediaRecorder.start();
+    drawings: {
+        // Drawing options can be expensive on performance
+        lines: false, // draw lines between atoms that arr effecting each other
+        circle: false, // draw atoms as circles
+        clusters: false,
+        background_color: "#000000", // Background color
     },
-  },
-  explore: false,
-  explorePeriod: 100,
-  chunkedThreads: false,
-  smartChunking: false,
-  particleSetSize: 50,
-  rules: {},
-  rulesArray: [],
-  radii: {},
-  radii2Array: [],
-  colors: [],
-  numColors: 4,
-  time_scale: 1.0,
-  viscosity: 0.7, // speed-dampening (can be >1 !)
-  gravity: 0.0, // pulling downward
-  pulseDuration: 10,
-  wallRepel: 40,
-  reset: () => {
-    randomAtoms(settings.atoms.count, true);
-  },
-  randomRules: () => {
-    settings.seed = local_seed; // last used seed is the new starting seed
-    startRandom();
-  },
-  symmetricRules: () => {
-    symmetricRules();
-    randomAtoms(settings.atoms.count, true);
-    updateGUIDisplay();
-  },
-  gui: null,
+    export: {
+        // Export a Screenshot image
+        image: () => {
+            const imageDataURL = canvas.toDataURL({
+                format: "png",
+                quality: 1,
+            });
+            dataURL_downloader(imageDataURL);
+        },
+        // Export a video recording
+        video: () => {
+            mediaRecorder.state == "recording"
+                ? mediaRecorder.stop()
+                : mediaRecorder.start();
+        },
+    },
+    explore: false,
+    explorePeriod: 100,
+    chunkedThreads: false,
+    smartChunking: false,
+    particleSetSize: 50,
+    rules: {},
+    usage: "",
+    rulesArray: [],
+    radii: {},
+    radii2Array: [],
+    colors: [],
+    numColors: 4,
+    force_scale: 1.0,
+    manual_frame_rate: false,
+    paused: false,
+    time_scale: 1.0,
+    viscosity: 0.7, // speed-dampening (can be >1 !)
+    gravity: 0.0, // pulling downward
+    pulseDuration: 10,
+    wallRepel: 40,
+    reset: () => {
+        randomAtoms(settings.atoms.count, true);
+    },
+    randomRules: () => {
+        settings.seed = local_seed; // last used seed is the new starting seed
+        startRandom();
+    },
+    symmetricRules: () => {
+        symmetricRules();
+        randomAtoms(settings.atoms.count, true);
+        updateGUIDisplay();
+    },
+    shutdown: () => {
+        fetch("http://localhost:8001/api/shutdown")
+    },
+    gui: null,
 };
 
 const setupClicks = () => {
-  canvas.addEventListener("click", (e) => {
-    pulse = settings.pulseDuration;
-    if (e.shiftKey) pulse = -pulse;
-    pulse_x = e.clientX;
-    pulse_y = e.clientY;
-  });
+    canvas.addEventListener("click", (e) => {
+        pulse = settings.pulseDuration;
+        if (e.shiftKey) pulse = -pulse;
+        pulse_x = e.clientX;
+        pulse_y = e.clientY;
+    });
 };
 const setupKeys = () => {
-  canvas.addEventListener("keydown", function (e) {
-    console.log(e.key);
-    switch (e.key) {
-      case "r":
-        settings.randomRules();
-        break;
-      case "t":
-        settings.drawings.clusters = !settings.drawings.clusters;
-        break;
-      case "o":
-        settings.reset();
-        break;
-      case "s":
-        settings.symmetricRules();
-        break;
-      default:
+    canvas.addEventListener("keydown", function (e) {
         console.log(e.key);
-    }
-  });
+        switch (e.key) {
+            case "r":
+                settings.randomRules();
+                break;
+            case "t":
+                settings.drawings.clusters = !settings.drawings.clusters;
+                break;
+            case "o":
+                settings.reset();
+                break;
+            case "s":
+                settings.symmetricRules();
+                break;
+            default:
+                console.log(e.key);
+        }
+    });
 };
 const updateGUIDisplay = () => {
-  console.log("gui", settings.gui);
-  settings.gui.destroy();
-  setupGUI();
+    console.log("gui", settings.gui);
+    settings.gui.destroy();
+    setupGUI();
 };
 Object.defineProperty(String.prototype, "capitalise", {
-  value: function () {
-    return this.charAt(0).toUpperCase() + this.slice(1);
-  },
-  enumerable: false,
+    value: function () {
+        return this.charAt(0).toUpperCase() + this.slice(1);
+    },
+    enumerable: false,
 });
 
 const smartChunking = {
-  active: false,
-  settled: false,
-  phase: "idle",
-  candidates: [],
-  candidateIndex: 0,
-  searchRound: 0,
-  sampleCount: 0,
-  sampleTotal: 0,
-  bestFps: 0,
-  bestSize: 100,
-  lastCandidateSize: 100,
-  framesPerSample: 8,
-  maxSearchRounds: 7,
-  improvementRatio: 0.02, // require 10% improvement to keep a new candidate size
+    active: false,
+    settled: false,
+    phase: "idle",
+    candidates: [],
+    candidateIndex: 0,
+    searchRound: 0,
+    sampleCount: 0,
+    sampleTotal: 0,
+    bestFps: 0,
+    bestSize: 100,
+    lastCandidateSize: 100,
+    framesPerSample: 20, // collect 20 frames per sample
+    maxSearchRounds: 14, // run 7 rounds of evaluation
+    improvementRatio: 0.1, // require 20% improvement to keep a new candidate size
+    // results: array of rounds { phase, sizes: [...], fps: [...] }
+    results: [],
+    currentRoundIndex: -1,
 };
 
 let smartChunkingController = null;
 let particleSetSizeController = null;
 
 function clampParticleSetSize(value) {
-  const maxSize = Math.max(1, atoms.length || settings.atoms.count);
-  return Math.min(maxSize, Math.max(1, Math.floor(value)));
+    const maxSize = Math.max(1, atoms.length || settings.atoms.count);
+    return Math.min(maxSize, Math.max(1, Math.floor(value)));
 }
 
 function clampSmartParticleSetSize(value) {
-  const maxSize = Math.max(
-    minSmartParticleSetSize,
-    atoms.length || settings.atoms.count,
-  );
-  return Math.min(
-    maxSize,
-    Math.max(minSmartParticleSetSize, Math.floor(value)),
-  );
+    const maxSize = Math.max(
+        minSmartParticleSetSize,
+        atoms.length || settings.atoms.count,
+    );
+    return Math.min(
+        maxSize,
+        Math.max(minSmartParticleSetSize, Math.floor(value)),
+    );
 }
 
 function setParticleSetSize(value) {
-  settings.particleSetSize = clampParticleSetSize(value);
-  if (particleSetSizeController) particleSetSizeController.updateDisplay();
-  invalidateServerStep();
+    settings.particleSetSize = clampParticleSetSize(value);
+    if (particleSetSizeController) particleSetSizeController.updateDisplay();
+    invalidateServerStep();
 }
 
 function getSmartParticleSetMax() {
-  return Math.max(minSmartParticleSetSize, atoms.length || settings.atoms.count);
+    return Math.max(minSmartParticleSetSize, atoms.length || settings.atoms.count);
 }
 
 function uniqueSmartParticleSetSizes(sizes) {
-  const seen = new Set();
-  const values = [];
+    const seen = new Set();
+    const values = [];
 
-  for (const size of sizes) {
-    const clampedSize = clampSmartParticleSetSize(size);
-    if (!seen.has(clampedSize)) {
-      seen.add(clampedSize);
-      values.push(clampedSize);
+    for (const size of sizes) {
+        const clampedSize = clampSmartParticleSetSize(size);
+        if (!seen.has(clampedSize)) {
+            seen.add(clampedSize);
+            values.push(clampedSize);
+        }
     }
-  }
 
-  return values.sort((a, b) => a - b);
+    return values.sort((a, b) => a - b);
 }
 
 function getCoarseSmartChunkingCandidates() {
-  const maxSize = getSmartParticleSetMax();
-  const candidateCount = 12;
-  const sizes = [settings.particleSetSize, minSmartParticleSetSize, maxSize];
+    const maxSize = getSmartParticleSetMax();
+    const candidateCount = 12;
+    const sizes = [settings.particleSetSize, minSmartParticleSetSize, maxSize];
 
-  if (maxSize <= minSmartParticleSetSize) {
+    if (maxSize <= minSmartParticleSetSize) {
+        return uniqueSmartParticleSetSizes(sizes);
+    }
+
+    const ratio = maxSize / minSmartParticleSetSize;
+    for (let i = 0; i < candidateCount; i++) {
+        const t = i / (candidateCount - 1);
+        sizes.push(minSmartParticleSetSize * ratio ** t);
+    }
+
     return uniqueSmartParticleSetSizes(sizes);
-  }
-
-  const ratio = maxSize / minSmartParticleSetSize;
-  for (let i = 0; i < candidateCount; i++) {
-    const t = i / (candidateCount - 1);
-    sizes.push(minSmartParticleSetSize * ratio ** t);
-  }
-
-  return uniqueSmartParticleSetSizes(sizes);
 }
 
 function getRefinedSmartChunkingCandidates() {
-  const maxSize = getSmartParticleSetMax();
-  const windowSize = Math.max(
-    1,
-    Math.round(smartChunking.bestSize / 2 ** smartChunking.searchRound),
-  );
-  const halfWindow = Math.max(1, Math.round(windowSize / 2));
+    const maxSize = getSmartParticleSetMax();
+    const windowSize = Math.max(
+        1,
+        Math.round(smartChunking.bestSize / 2 ** smartChunking.searchRound),
+    );
+    const halfWindow = Math.max(1, Math.round(windowSize / 2));
 
-  return uniqueSmartParticleSetSizes([
-    smartChunking.bestSize - windowSize,
-    smartChunking.bestSize - halfWindow,
-    smartChunking.bestSize,
-    smartChunking.bestSize + halfWindow,
-    smartChunking.bestSize + windowSize,
-    minSmartParticleSetSize,
-    maxSize,
-  ]);
+    return uniqueSmartParticleSetSizes([
+        smartChunking.bestSize - windowSize,
+        smartChunking.bestSize - halfWindow,
+        smartChunking.bestSize,
+        smartChunking.bestSize + halfWindow,
+        smartChunking.bestSize + windowSize,
+        minSmartParticleSetSize,
+        maxSize,
+    ]);
 }
 
 function startSmartChunkingCandidates(candidates, phase) {
-  smartChunking.candidates = candidates;
-  smartChunking.candidateIndex = 0;
-  smartChunking.phase = phase;
-  smartChunking.sampleCount = 0;
-  smartChunking.sampleTotal = 0;
+    smartChunking.candidates = candidates;
+    smartChunking.candidateIndex = 0;
+    smartChunking.phase = phase;
+    smartChunking.sampleCount = 0;
+    smartChunking.sampleTotal = 0;
 
-  if (smartChunking.candidates.length === 0) {
-    settleSmartChunking();
-    return;
-  }
+    if (smartChunking.candidates.length === 0) {
+        settleSmartChunking();
+        return;
+    }
 
-  smartChunking.lastCandidateSize = smartChunking.candidates[0];
-  setParticleSetSize(smartChunking.lastCandidateSize);
+    smartChunking.lastCandidateSize = smartChunking.candidates[0];
+    setParticleSetSize(smartChunking.lastCandidateSize);
+
+    // start a new results round for CSV export
+    smartChunking.results.push({
+        phase,
+        sizes: smartChunking.candidates.slice(),
+        fps: new Array(smartChunking.candidates.length).fill(null),
+    });
+    smartChunking.currentRoundIndex = smartChunking.results.length - 1;
 }
 
-function updateChunkingControllers() {
-  if (!smartChunkingController) return;
+async function updateChunkingControllers() {
+    if (!smartChunkingController) return;
 
-  if (settings.chunkedThreads) {
-    smartChunkingController.enable();
-  } else {
-    settings.smartChunking = false;
-    smartChunking.active = false;
-    smartChunking.settled = false;
-    smartChunking.phase = "idle";
-    smartChunkingController.disable();
-    smartChunkingController.updateDisplay();
-  }
+    if (settings.chunkedThreads) {
+        smartChunkingController.enable();
+    } else {
+        settings.smartChunking = false;
+        smartChunking.active = false;
+        smartChunking.settled = false;
+        smartChunking.phase = "idle";
+        smartChunkingController.disable();
+        smartChunkingController.updateDisplay();
+    }
 }
 
 function resetSmartChunking() {
-  smartChunking.active = settings.chunkedThreads && settings.smartChunking;
-  smartChunking.settled = false;
-  smartChunking.phase = smartChunking.active ? "coarse" : "idle";
-  smartChunking.candidates = [];
-  smartChunking.candidateIndex = 0;
-  smartChunking.searchRound = 0;
-  smartChunking.sampleCount = 0;
-  smartChunking.sampleTotal = 0;
-  smartChunking.bestFps = 0;
-  smartChunking.bestSize = smartChunking.active
-    ? clampSmartParticleSetSize(settings.particleSetSize)
-    : clampParticleSetSize(settings.particleSetSize);
-  smartChunking.lastCandidateSize = smartChunking.bestSize;
-  setParticleSetSize(smartChunking.bestSize);
+    smartChunking.active = settings.chunkedThreads && settings.smartChunking;
+    smartChunking.settled = false;
+    smartChunking.phase = smartChunking.active ? "coarse" : "idle";
+    smartChunking.candidates = [];
+    smartChunking.candidateIndex = 0;
+    smartChunking.searchRound = 0;
+    smartChunking.sampleCount = 0;
+    smartChunking.sampleTotal = 0;
+    smartChunking.bestFps = 0;
+    smartChunking.bestSize = smartChunking.active
+        ? clampSmartParticleSetSize(settings.particleSetSize)
+        : clampParticleSetSize(settings.particleSetSize);
+    smartChunking.lastCandidateSize = smartChunking.bestSize;
+    setParticleSetSize(smartChunking.bestSize);
 
-  if (smartChunking.active) {
-    startSmartChunkingCandidates(getCoarseSmartChunkingCandidates(), "coarse");
-  }
+    // reset any previous results
+    smartChunking.results = [];
+    smartChunking.currentRoundIndex = -1;
+
+    if (smartChunking.active) {
+        startSmartChunkingCandidates(getCoarseSmartChunkingCandidates(), "coarse");
+    }
 }
 
 function sampleSmartChunking(fps) {
-  if (
-    !settings.chunkedThreads ||
-    !settings.smartChunking ||
-    !smartChunking.active ||
-    smartChunking.settled ||
-    !Number.isFinite(fps) ||
-    fps <= 0
-  ) {
-    return null;
-  }
+    if (
+        !settings.chunkedThreads ||
+        !settings.smartChunking ||
+        !smartChunking.active ||
+        smartChunking.settled ||
+        !Number.isFinite(fps) ||
+        fps <= 0
+    ) {
+        return null;
+    }
 
-  smartChunking.sampleCount += 1;
-  smartChunking.sampleTotal += fps;
+    smartChunking.sampleCount += 1;
+    smartChunking.sampleTotal += fps;
 
-  if (smartChunking.sampleCount < smartChunking.framesPerSample) return null;
+    if (smartChunking.sampleCount < smartChunking.framesPerSample) return null;
 
-  const averageFps = smartChunking.sampleTotal / smartChunking.sampleCount;
-  smartChunking.sampleCount = 0;
-  smartChunking.sampleTotal = 0;
+    const averageFps = smartChunking.sampleTotal / smartChunking.sampleCount;
+    smartChunking.sampleCount = 0;
+    smartChunking.sampleTotal = 0;
 
-  return averageFps;
+    return averageFps;
 }
 
 function smartChunkingImproved(fps) {
-  return fps > smartChunking.bestFps * (1 + smartChunking.improvementRatio);
+    return fps > smartChunking.bestFps * (1 + smartChunking.improvementRatio);
 }
 
 function settleSmartChunking() {
-  smartChunking.active = false;
-  smartChunking.settled = true;
-  smartChunking.phase = "settled";
-  setParticleSetSize(smartChunking.bestSize);
+    smartChunking.active = false;
+    smartChunking.settled = true;
+    smartChunking.phase = "settled";
+    setParticleSetSize(smartChunking.bestSize);
+
+    // Download results as CSV when smart chunking finishes
+    try {
+        downloadSmartChunkingResults();
+    } catch (e) {
+        console.warn('Failed to download smart chunking CSV', e);
+    }
 }
 
 function updateSmartChunking(fps) {
-  const averageFps = sampleSmartChunking(fps);
-  if (averageFps === null) return;
+    const averageFps = sampleSmartChunking(fps);
+    if (averageFps === null) return;
 
-  if (smartChunkingImproved(averageFps)) {
-    smartChunking.bestFps = averageFps;
-    smartChunking.bestSize = smartChunking.lastCandidateSize;
-  }
+    // store the sample for CSV export if we have a current round
+    if (
+        smartChunking.currentRoundIndex !== -1 &&
+        smartChunking.results[smartChunking.currentRoundIndex]
+    ) {
+        const roundEntry = smartChunking.results[smartChunking.currentRoundIndex];
+        roundEntry.fps[smartChunking.candidateIndex] = averageFps;
+    }
 
-  smartChunking.candidateIndex += 1;
-  if (smartChunking.candidateIndex < smartChunking.candidates.length) {
-    smartChunking.lastCandidateSize =
-      smartChunking.candidates[smartChunking.candidateIndex];
-    setParticleSetSize(smartChunking.lastCandidateSize);
-    return;
-  }
+    if (smartChunkingImproved(averageFps)) {
+        smartChunking.bestFps = averageFps;
+        smartChunking.bestSize = smartChunking.lastCandidateSize;
+    }
 
-  smartChunking.searchRound += 1;
-  if (smartChunking.searchRound >= smartChunking.maxSearchRounds) {
-    settleSmartChunking();
-    return;
-  }
+    smartChunking.candidateIndex += 1;
+    if (smartChunking.candidateIndex < smartChunking.candidates.length) {
+        smartChunking.lastCandidateSize =
+            smartChunking.candidates[smartChunking.candidateIndex];
+        setParticleSetSize(smartChunking.lastCandidateSize);
+        return;
+    }
 
-  startSmartChunkingCandidates(
-    getRefinedSmartChunkingCandidates(),
-    "refine",
-  );
+    smartChunking.searchRound += 1;
+    if (smartChunking.searchRound >= smartChunking.maxSearchRounds) {
+        settleSmartChunking();
+        return;
+    }
+
+    startSmartChunkingCandidates(
+        getRefinedSmartChunkingCandidates(),
+        "refine",
+    );
 }
 
 // Build GUI
-const setupGUI = () => {
-  settings.gui = new lil.GUI();
-  // Configs
-  const configFolder = settings.gui.addFolder("Config");
-  configFolder.add(settings, "reset").name("Reset");
-  configFolder.add(settings, "randomRules").name("Random Rules");
-  configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
-  configFolder
-    .add(settings, "numColors", 1, 19, 1)
-    .name("Number of Colors")
-    .listen()
-    .onFinishChange((v) => {
-      setNumberOfColors();
-      startRandom();
-      resetSmartChunking();
-    });
-  configFolder
-    .add(settings, "seed")
-    .name("Seed")
-    .listen()
-    .onFinishChange((v) => {
-      startRandom();
-    });
-  configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
-  configFolder
-    .add(settings.atoms, "count", 1, 3000, 1)
-    .name("Atoms per-color")
-    .listen()
-    .onFinishChange((v) => {
-      randomAtoms(v, true);
-      resetSmartChunking();
-    });
-  configFolder
-    .add(settings, "time_scale", 0.1, 5, 0.01)
-    .name("Time Scale")
-    .listen();
-  configFolder
-    .add(settings, "viscosity", 0.1, 2, 0.1)
-    .name("Viscosity")
-    .listen();
-
-  configFolder.add(settings, "gravity", 0, 1, 0.05).name("Gravity").listen();
-  configFolder
-    .add(settings, "explorePeriod", 1, 500, 1)
-    .name("Mutation Frequency")
-    .listen();
-  configFolder
-    .add(settings, "pulseDuration", 1, 100, 1)
-    .name("Click Pulse Duration")
-    .listen();
-
-  configFolder
-    .add(settings, "wallRepel", 0, 100, 1)
-    .name("Wall Repel")
-    .listen();
-  configFolder.add(settings, "explore").name("Random Mutations").listen();
-  configFolder
-    .add(settings, "chunkedThreads")
-    .name("Chunked Threads")
-    .listen()
-    .onFinishChange(() => {
-      updateChunkingControllers();
-      resetSmartChunking();
-      invalidateServerStep();
-    });
-  smartChunkingController = configFolder
-    .add(settings, "smartChunking")
-    .name("Smart Chunking")
-    .listen()
-    .onFinishChange(() => {
-      resetSmartChunking();
-      invalidateServerStep();
-    });
-  particleSetSizeController = configFolder
-    .add(settings, "particleSetSize", 20, 4000, 5)
-    .name("Particles per Thread")
-    .listen()
-    .onFinishChange((v) => {
-      setParticleSetSize(v);
-    });
-  updateChunkingControllers();
-  // Drawings
-  const drawingsFolder = settings.gui.addFolder("Drawings");
-  drawingsFolder
-    .add(settings.atoms, "radius", 1, 10, 0.5)
-    .name("Radius")
-    .listen();
-  drawingsFolder.add(settings.drawings, "circle").name("Circle Shape").listen();
-  drawingsFolder
-    .add(settings.drawings, "clusters")
-    .name("Track Clusters")
-    .listen();
-  drawingsFolder.add(settings.drawings, "lines").name("Draw Lines").listen();
-  drawingsFolder
-    .addColor(settings.drawings, "background_color")
-    .name("Background Color")
-    .listen();
-  // Export
-  const exportFolder = settings.gui.addFolder("Export");
-  exportFolder.add(settings.export, "image").name("Image");
-  exportFolder.add(settings.export, "video").name("Video: Start / stop");
-  // Colors
-  for (const atomColor of settings.colors) {
-    const colorFolder = settings.gui.addFolder(
-      `Rules: <font color='${atomColor}'>${atomColor.capitalise()}</font>`,
-    );
-    for (const ruleColor of settings.colors) {
-      colorFolder
-        .add(settings.rules[atomColor], ruleColor, -1, 1, 0.001)
-        .name(`<-> <font color='${ruleColor}'>${ruleColor.capitalise()}</font>`)
+const setupGUI = (async () => {
+    settings.gui = new lil.GUI();
+    // Configs
+    const configFolder = settings.gui.addFolder("Config");
+    configFolder.add(settings, "reset").name("Reset");
+    configFolder.add(settings, "randomRules").name("Random Rules");
+    configFolder.add(settings, "symmetricRules").name("Symmetric Rules");
+    configFolder.add(settings, "shutdown").name("Shutdown");
+    configFolder
+        .add(settings, "numColors", 1, 19, 1)
+        .name("Number of Colors")
         .listen()
         .onFinishChange((v) => {
-          flattenRules();
+            setNumberOfColors();
+            startRandom();
+            resetSmartChunking();
         });
+    configFolder
+        .add(settings, "seed")
+        .name("Seed")
+        .listen()
+        .onFinishChange((v) => {
+            startRandom();
+        });
+    if (settings.paused == false) {
+        configFolder.add(settings, "paused").name("Pause")
+    } else {
+        configFolder.add(settings, "paused").name("Unpause")
     }
-    colorFolder
-      .add(settings.radii, atomColor, 1, maxRadius, 5)
-      .name("Radius")
-      .listen()
-      .onFinishChange((v) => {
-        flattenRules();
-      });
-  }
-};
+    configFolder.add(settings, "fps").name("FPS - (Server)").listen().disable();
+    configFolder.add(settings, "clientFps").name("FPS - (Client)").listen().disable();
+    configFolder.add(settings, "commonFps").name("FPS - (Common)").listen().disable();
+    configFolder.add(settings, "framesThisSecond").name("Frames This Seconds").listen().disable();
+    configFolder.add(settings, "usage").name("CPU Usage (%)").listen().disable();
+    configFolder.add(settings, "totv").name("Total V").listen().disable();
+    configFolder.add(settings, "atomCount").name("Atom Count").listen().disable()
+    configFolder
+        .add(settings.atoms, "count", 1, 3000, 1)
+        .name("Atoms per-color")
+        .listen()
+        .onFinishChange((v) => {
+            randomAtoms(v, true);
+            resetSmartChunking();
+        });
+    configFolder
+        .add(settings, "force_scale", 0.1, 5, 0.01)
+        .name("Force Scale")
+        .listen();
+    configFolder
+        .add(settings, "manual_frame_rate")
+        .name("Manual Frame Rate")
+        .listen();
+    configFolder
+        .add(settings, "time_scale", 0.01, 10, 0.01)
+        .name("Time Scale")
+        .listen();
+    configFolder
+        .add(settings, "viscosity", 0.1, 2, 0.1)
+        .name("Viscosity")
+        .listen();
+
+    configFolder.add(settings, "gravity", -2, 2, 0.01).name("Gravity").listen();
+    configFolder
+        .add(settings, "explorePeriod", 1, 500, 1)
+        .name("Mutation Frequency")
+        .listen();
+    configFolder
+        .add(settings, "pulseDuration", 1, 100, 1)
+        .name("Click Pulse Duration")
+        .listen();
+
+    configFolder
+        .add(settings, "wallRepel", 0, 200, 1)
+        .name("Wall Repel")
+        .listen();
+    configFolder.add(settings, "explore").name("Random Mutations").listen();
+    setTimeout(async() => {if ( await settings.deviceCoreCount >= 8 ) {
+        configFolder
+            .add(settings, "chunkedThreads")
+            .name("Fine Threading")
+            .listen()
+            .onFinishChange(() => {
+                updateChunkingControllers();
+                resetSmartChunking();
+                invalidateServerStep();
+            });
+    smartChunkingController = configFolder
+        .add(settings, "smartChunking")
+        .name("Smart Parallelism")
+        .listen()
+        .onFinishChange(() => {
+            resetSmartChunking();
+            invalidateServerStep();
+        });
+    particleSetSizeController = configFolder
+        .add(settings, "particleSetSize", 20, 4000, 1)
+        .name("Particles per Thread")
+        .listen()
+        .onFinishChange((v) => {
+            setParticleSetSize(v);
+        });
+    }}, 100);
+    updateChunkingControllers();
+    // Drawings
+    const drawingsFolder = settings.gui.addFolder("Drawings");
+    drawingsFolder
+        .add(settings.atoms, "radius", 1, 10, 0.5)
+        .name("Radius")
+        .listen();
+    drawingsFolder.add(settings.drawings, "circle").name("Circle Shape").listen();
+    drawingsFolder
+        .add(settings.drawings, "clusters")
+        .name("Track Clusters")
+        .listen();
+    drawingsFolder.add(settings.drawings, "lines").name("Draw Lines").listen();
+    drawingsFolder
+        .addColor(settings.drawings, "background_color")
+        .name("Background Color")
+        .listen();
+    // Export
+    const exportFolder = settings.gui.addFolder("Export");
+    exportFolder.add(settings.export, "image").name("Image");
+    exportFolder.add(settings.export, "video").name("Video: Start / stop");
+    // Colors
+    for (const atomColor of settings.colors) {
+        const colorFolder = settings.gui.addFolder(
+            `Rules: <font color='${atomColor}'>${atomColor.capitalise()}</font>`,
+        );
+        for (const ruleColor of settings.colors) {
+            colorFolder
+                .add(settings.rules[atomColor], ruleColor, -1, 1, 0.001)
+                .name(`<-> <font color='${ruleColor}'>${ruleColor.capitalise()}</font>`)
+                .listen()
+                .onFinishChange((v) => {
+                    flattenRules();
+                });
+        }
+        colorFolder
+            .add(settings.radii, atomColor, 1, maxRadius, 5)
+            .name("Radius")
+            .listen()
+            .onFinishChange((v) => {
+                flattenRules();
+            });
+    }
+});
 
 // Seedable 'decent' random generator
 var local_seed = settings.seed;
+
 function mulberry32() {
-  let t = (local_seed += 0x6d2b79f5);
-  t = Math.imul(t ^ (t >>> 15), t | 1);
-  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    let t = (local_seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 
 function loadSeedFromUrl() {
-  let hash = window.location.hash;
-  if (hash != undefined && hash[0] == "#") {
-    let param = Number(hash.substr(1)); // remove the leading '#'
-    if (isFinite(param)) {
-      settings.seed = param;
-      console.log("Using seed " + settings.seed);
+    let hash = window.location.hash;
+    if (hash != undefined && hash[0] == "#") {
+        let param = Number(hash.substr(1)); // remove the leading '#'
+        if (isFinite(param)) {
+            settings.seed = param;
+            console.log("Using seed " + settings.seed);
+        }
     }
-  }
 }
 
 function randomRules() {
-  if (!isFinite(settings.seed)) settings.seed = 0xcafecafe;
-  window.location.hash = "#" + settings.seed;
-  document.title = "Life #" + settings.seed;
-  local_seed = settings.seed;
-  console.log("Seed=" + local_seed);
-  for (const i of settings.colors) {
-    settings.rules[i] = {};
-    for (const j of settings.colors) {
-      settings.rules[i][j] = mulberry32() * 2 - 1;
+    if (!isFinite(settings.seed)) settings.seed = 0xcafecafe;
+    window.location.hash = "#" + settings.seed;
+    document.title = "Life #" + settings.seed;
+    local_seed = settings.seed;
+    console.log("Seed=" + local_seed);
+    for (const i of settings.colors) {
+        settings.rules[i] = {};
+        for (const j of settings.colors) {
+            settings.rules[i][j] = mulberry32() * 2 - 1;
+        }
+        settings.radii[i] = 80;
     }
-    settings.radii[i] = 80;
-  }
-  console.log(JSON.stringify(settings.rules));
-  flattenRules();
+    console.log(JSON.stringify(settings.rules));
+    flattenRules();
 }
 
 function symmetricRules() {
-  for (const i of settings.colors) {
-    for (const j of settings.colors) {
-      if (j < i) {
-        let v = 0.5 * (settings.rules[i][j] + settings.rules[j][i]);
-        settings.rules[i][j] = settings.rules[j][i] = v;
-      }
+    for (const i of settings.colors) {
+        for (const j of settings.colors) {
+            if (j < i) {
+                let v = 0.5 * (settings.rules[i][j] + settings.rules[j][i]);
+                settings.rules[i][j] = settings.rules[j][i] = v;
+            }
+        }
     }
-  }
-  console.log(JSON.stringify(settings.rules));
-  flattenRules();
+    console.log(JSON.stringify(settings.rules));
+    flattenRules();
 }
 
 function flattenRules() {
-  settings.rulesArray = [];
-  settings.radii2Array = [];
-  for (const c1 of settings.colors) {
-    for (const c2 of settings.colors) {
-      settings.rulesArray.push(settings.rules[c1][c2]);
+    settings.rulesArray = [];
+    settings.radii2Array = [];
+    for (const c1 of settings.colors) {
+        for (const c2 of settings.colors) {
+            settings.rulesArray.push(settings.rules[c1][c2]);
+        }
+        settings.radii2Array.push(settings.radii[c1] * settings.radii[c1]);
     }
-    settings.radii2Array.push(settings.radii[c1] * settings.radii[c1]);
-  }
-  invalidateServerStep();
+    invalidateServerStep();
+}
+
+function shutdown() {
+    fetch("https://localhost:8001/api/shutdown")
 }
 
 function updateCanvasDimensions() {
-  canvas.width = window.innerWidth * 0.9;
-  canvas.height = window.innerHeight * 0.9;
+    const nextWidth = window.innerWidth * 0.9;
+    const nextHeight = window.innerHeight * 0.9;
+    if (nextWidth === lastCanvasWidth && nextHeight === lastCanvasHeight) return false;
+
+    lastCanvasWidth = nextWidth;
+    lastCanvasHeight = nextHeight;
+    canvas.width = nextWidth;
+    canvas.height = nextHeight;
+    return true;
 }
 
 // Initiate Random locations for Atoms ( used when atoms created )
 function randomX() {
-  return mulberry32() * (canvas.width - 100) + 50;
+    return mulberry32() * (canvas.width - 100) + 50;
 }
 
 function randomY() {
-  return mulberry32() * (canvas.height - 100) + 50;
+    return mulberry32() * (canvas.height - 100) + 50;
 }
 
 /* Create an Atom - Use matrices for x4/5 performance improvement
@@ -549,31 +631,31 @@ atom[3] = ay
 atom[4] = color (index)
 */
 const create = (number, color) => {
-  for (let i = 0; i < number; i++) {
-    atoms.push([randomX(), randomY(), 0, 0, color]);
-  }
+    for (let i = 0; i < number; i++) {
+        atoms.push([randomX(), randomY(), 0, 0, color]);
+    }
 };
 
 function randomAtoms(number_of_atoms_per_color, clear_previous) {
-  if (clear_previous) atoms.length = 0;
-  for (let c = 0; c < settings.colors.length; c++) {
-    create(number_of_atoms_per_color, c);
-  }
-  clusters.length = 0;
-  invalidateServerStep();
+    if (clear_previous) atoms.length = 0;
+    for (let c = 0; c < settings.colors.length; c++) {
+        create(number_of_atoms_per_color, c);
+    }
+    clusters.length = 0;
+    invalidateServerStep();
 }
 
 function startRandom() {
-  randomRules();
-  randomAtoms(settings.atoms.count, true);
-  updateGUIDisplay();
+    randomRules();
+    randomAtoms(settings.atoms.count, true);
+    updateGUIDisplay();
 }
 
 function setNumberOfColors() {
-  settings.colors = [];
-  for (let i = 0; i < settings.numColors; ++i) {
-    settings.colors.push(predefinedColors[i]);
-  }
+    settings.colors = [];
+    for (let i = 0; i < settings.numColors; ++i) {
+        settings.colors.push(predefinedColors[i]);
+    }
 }
 
 // Run Application
@@ -582,191 +664,336 @@ loadSeedFromUrl();
 // Canvas
 const canvas = document.getElementById("canvas");
 const m = canvas.getContext("2d");
+let lastCanvasWidth = 0;
+let lastCanvasHeight = 0;
 
 let serverStepInFlight = false;
 let serverStepFailed = false;
 let lineWarningShown = false;
 let simulationVersion = 0;
+const applyRulesRequestHeaderBytes = 88;
+const applyRulesResponseHeaderBytes = 32;
+
+function buildApplyRulesRequestBuffer() {
+    const atomCount = atoms.length;
+    const ruleCount = settings.rulesArray.length;
+    const radiiCount = settings.radii2Array.length;
+    const buffer = new ArrayBuffer(
+        applyRulesRequestHeaderBytes +
+            (atomCount * 5 + ruleCount + radiiCount) * Float64Array.BYTES_PER_ELEMENT,
+    );
+    const view = new DataView(buffer);
+    let offset = 0;
+
+    view.setUint32(offset, atomCount, true);
+    offset += 4;
+    view.setUint32(offset, settings.numColors, true);
+    offset += 4;
+    view.setFloat64(offset, pulse, true);
+    offset += 8;
+    view.setFloat64(offset, pulse_x, true);
+    offset += 8;
+    view.setFloat64(offset, pulse_y, true);
+    offset += 8;
+    view.setFloat64(offset, settings.force_scale, true);
+    offset += 8;
+    view.setFloat64(offset, settings.wallRepel, true);
+    offset += 8;
+    view.setFloat64(offset, canvas.width, true);
+    offset += 8;
+    view.setFloat64(offset, canvas.height, true);
+    offset += 8;
+    view.setFloat64(offset, settings.gravity, true);
+    offset += 8;
+    view.setFloat64(offset, settings.viscosity, true);
+    offset += 8;
+    view.setUint8(offset, settings.chunkedThreads ? 1 : 0);
+    offset += 1;
+    view.setUint8(offset, 0);
+    view.setUint8(offset + 1, 0);
+    view.setUint8(offset + 2, 0);
+    offset += 3;
+    view.setUint32(offset, settings.particleSetSize, true);
+    offset += 4;
+
+    const atomsView = new Float64Array(buffer, offset, atomCount * 5);
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        const atom = atoms[i];
+        atomsView[atomOffset] = atom[0];
+        atomsView[atomOffset + 1] = atom[1];
+        atomsView[atomOffset + 2] = atom[2];
+        atomsView[atomOffset + 3] = atom[3];
+        atomsView[atomOffset + 4] = atom[4];
+        atomOffset += 5;
+    }
+    offset += atomCount * 5 * Float64Array.BYTES_PER_ELEMENT;
+
+    new Float64Array(buffer, offset, ruleCount).set(settings.rulesArray);
+    offset += ruleCount * Float64Array.BYTES_PER_ELEMENT;
+    new Float64Array(buffer, offset, radiiCount).set(settings.radii2Array);
+
+    return buffer;
+}
+
+function decodeApplyRulesResponse(buffer) {
+    if (buffer.byteLength < applyRulesResponseHeaderBytes) {
+        throw new Error("Invalid binary response");
+    }
+    const view = new DataView(buffer);
+    let offset = 0;
+    const atomCount = view.getUint32(offset, true);
+    offset += 4;
+    const deviceCores = view.getUint32(offset, true);
+    offset += 4;
+    const fps = view.getFloat64(offset, true);
+    offset += 8;
+    const totalV = view.getFloat64(offset, true);
+    offset += 8;
+    const usage = view.getFloat64(offset, true);
+    offset += 8;
+
+    const atoms = new Array(atomCount);
+    const atomsView = new Float64Array(buffer, offset, atomCount * 5);
+    let atomOffset = 0;
+    for (let i = 0; i < atomCount; i++) {
+        atoms[i] = [
+            atomsView[atomOffset],
+            atomsView[atomOffset + 1],
+            atomsView[atomOffset + 2],
+            atomsView[atomOffset + 3],
+            atomsView[atomOffset + 4],
+        ];
+        atomOffset += 5;
+    }
+
+    return {atoms, fps, totalV, deviceCores, usage};
+}
 
 function invalidateServerStep() {
-  simulationVersion += 1;
-  serverStepFailed = false;
+    simulationVersion += 1;
+    serverStepFailed = false;
 }
 
 function syncServerAtoms(nextAtoms) {
-  atoms.length = nextAtoms.length;
-  for (let i = 0; i < nextAtoms.length; i++) {
-    atoms[i] = nextAtoms[i];
-  }
+    atoms.length = nextAtoms.length;
+    for (let i = 0; i < nextAtoms.length; i++) {
+        atoms[i] = nextAtoms[i];
+    }
 }
+
+var numberOfRequests = 0;
 
 function applyRulesOnServer() {
-  if (serverStepInFlight || serverStepFailed) return;
+    if (serverStepInFlight || serverStepFailed) return;
 
-  const requestVersion = simulationVersion;
-  serverStepInFlight = true;
-  fetch("/api/apply-rules", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      atoms,
-      rulesArray: settings.rulesArray,
-      radii2Array: settings.radii2Array,
-      numColors: settings.numColors,
-      pulse,
-      pulseX: pulse_x,
-      pulseY: pulse_y,
-      timeScale: settings.time_scale,
-      wallRepel: settings.wallRepel,
-      canvasWidth: canvas.width,
-      canvasHeight: canvas.height,
-      gravity: settings.gravity,
-      viscosity: settings.viscosity,
-      chunkedThreads: settings.chunkedThreads,
-      particleSetSize: settings.particleSetSize,
-    }),
-  })
-    .then((response) => {
-      if (!response.ok)
-        throw new Error(`Server applyRules failed: ${response.status}`);
-      return response.json();
-    })
-    .then((result) => {
-      if (requestVersion !== simulationVersion) return;
-      total_v = result.totalV;
-      if (Number.isFinite(result.fps)) settings.fps = result.fps;
-      syncServerAtoms(result.atoms);
-      updateSmartChunking(result.fps);
-    })
-    .catch((error) => {
-      serverStepFailed = true;
-      console.warn("Server applyRules unavailable; simulation paused.", error);
-    })
-    .finally(() => {
-      serverStepInFlight = false;
-    });
+    const requestVersion = simulationVersion;
+    const requestStartedAt = performance.now();
+
+    if (!settings.paused == true) {
+        serverStepInFlight = true;
+        const requestBody = buildApplyRulesRequestBuffer();
+        fetch("/api/apply-rules", {
+            method: "POST",
+            cache: "no-store",
+            headers: {
+                "Content-Type": "application/octet-stream",
+                Accept: "application/octet-stream",
+            },
+            body: requestBody,
+        })
+            .then(async (response) => {
+                const roundTripMs = performance.now() - requestStartedAt;
+                if (roundTripMs > 0) {
+                    const newFps = 1000 / roundTripMs;
+                    settings.commonFps = Math.round(
+                        settings.commonFps * 0.8 + newFps * 0.2,
+                    );
+                }
+                if (!response.ok)
+                    throw new Error(`Server applyRules failed: ${response.status}`);
+                const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+                if (contentType.includes("application/octet-stream")) {
+                    return decodeApplyRulesResponse(await response.arrayBuffer());
+                }
+                return response.json();
+            })
+            .then((result) => {
+                if (requestVersion !== simulationVersion) return;
+                total_v = result.totalV;
+                settings.totv = Math.round(result.totalV * 10) / 10;
+                settings.fps = result.fps;
+                settings.usage = result.usage;
+                settings.atomCount = result.atoms.length;
+                if (numberOfRequests === 0) {
+                settings.deviceCoreCount = result.deviceCores;
+                }
+                syncServerAtoms(result.atoms);
+                settings.framesThisSecond += 1
+                updateSmartChunking(result.fps);
+            })
+            .catch((error) => {
+                serverStepFailed = true;
+                console.warn("Server applyRules unavailable; simulation paused.", error);
+            })
+            .finally(() => {
+                serverStepInFlight = false;
+            });
+    } else {
+        settings.fps = 0
+        settings.commonFps = 0
+    }
 }
+
 // Draw a square
 const drawSquare = (x, y, color, radius) => {
-  m.fillStyle = color;
-  m.fillRect(x - radius, y - radius, 2 * radius, 2 * radius);
+    m.fillStyle = color;
+    m.fillRect(x - radius, y - radius, 2 * radius, 2 * radius);
 };
 
 // Draw a circle
 function drawCircle(x, y, color, radius, fill = true) {
-  m.beginPath();
-  m.arc(x, y, radius, 0 * Math.PI, 2 * Math.PI); // x, y, radius, ArcStart, ArcEnd
-  m.closePath();
-  m.strokeStyle = m.fillStyle = color;
-  fill ? m.fill() : m.stroke();
+    m.beginPath();
+    m.arc(x, y, radius, 0 * Math.PI, 2 * Math.PI); // x, y, radius, ArcStart, ArcEnd
+    m.closePath();
+    m.strokeStyle = m.fillStyle = color;
+    fill ? m.fill() : m.stroke();
 }
 
 // Draw a line between two atoms
 function drawLineBetweenAtoms(ax, ay, bx, by, color) {
-  m.beginPath();
-  m.moveTo(ax, ay);
-  m.lineTo(bx, by);
-  m.closePath();
-  m.strokeStyle = color;
-  m.stroke();
+    m.beginPath();
+    m.moveTo(ax, ay);
+    m.lineTo(bx, by);
+    m.closePath();
+    m.strokeStyle = color;
+    m.stroke();
 }
 
 // [position-x, position-y, radius, color]
 //    /* tmp accumulators: */
 //  {count, accum-x, accum-y, accum-d^2, accum-color}]
 let clusters = [];
+let clusterAccums = [];
+
 function newCluster() {
-  return [randomX(), randomY(), maxRadius, "white"];
+    return [randomX(), randomY(), maxRadius, "white"];
 }
+
 function addNewClusters(num_clusters) {
-  if (clusters.length < num_clusters / 2) {
-    while (clusters.length < num_clusters) clusters.push(newCluster());
-  }
+    if (clusters.length < num_clusters / 2) {
+        while (clusters.length < num_clusters) clusters.push(newCluster());
+    }
 }
+
+function getClusterAccums(count) {
+    if (clusterAccums.length < count) {
+        for (let i = clusterAccums.length; i < count; ++i) {
+            clusterAccums[i] = [0, 0, 0, 0, 0];
+        }
+    }
+
+    for (let i = 0; i < count; ++i) {
+        const a = clusterAccums[i];
+        a[0] = 0;
+        a[1] = 0;
+        a[2] = 0;
+        a[3] = 0;
+        a[4] = 0;
+    }
+
+    clusterAccums.length = count;
+    return clusterAccums;
+}
+
 function findNearestCluster(x, y) {
-  let best = -1;
-  let best_d2 = 1e38;
-  for (let i = 0; i < clusters.length; ++i) {
-    const c = clusters[i];
-    const dx = c[0] - x;
-    const dy = c[1] - y;
-    const d2 = dx * dx + dy * dy;
-    if (d2 < best_d2) {
-      best = i;
-      best_d2 = d2;
+    let best = -1;
+    let best_d2 = 1e38;
+    for (let i = 0; i < clusters.length; ++i) {
+        const c = clusters[i];
+        const dx = c[0] - x;
+        const dy = c[1] - y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < best_d2) {
+            best = i;
+            best_d2 = d2;
+        }
     }
-  }
-  return [best, best_d2];
+    return [best, best_d2];
 }
+
 function moveClusters(accums) {
-  let max_d = 0; // record max cluster displacement
-  for (let i = 0; i < clusters.length; ++i) {
-    let c = clusters[i];
-    const a = accums[i];
-    if (a[0] > minClusterSize) {
-      const norm = 1 / a[0];
-      const new_x = a[1] * norm;
-      const new_y = a[2] * norm;
-      max_d = Math.max(max_d, Math.abs(c[0] - new_x), Math.abs(c[1] - new_y));
-      c[0] = new_x;
-      c[1] = new_y;
+    let max_d = 0; // record max cluster displacement
+    for (let i = 0; i < clusters.length; ++i) {
+        let c = clusters[i];
+        const a = accums[i];
+        if (a[0] > minClusterSize) {
+            const norm = 1 / a[0];
+            const new_x = a[1] * norm;
+            const new_y = a[2] * norm;
+            max_d = Math.max(max_d, Math.abs(c[0] - new_x), Math.abs(c[1] - new_y));
+            c[0] = new_x;
+            c[1] = new_y;
+        }
     }
-  }
-  return max_d;
+    return max_d;
 }
+
 function finalizeClusters(accums) {
-  for (let i = 0; i < clusters.length; ++i) {
-    let c = clusters[i];
-    const a = accums[i];
-    if (a[0] > minClusterSize) {
-      const norm = 1 / a[0];
-      const new_r = 1.1 * Math.sqrt(a[3] * norm); // with 10% extra room
-      c[2] = 0.95 * c[2] + 0.05 * new_r; // exponential smoothing
-      // 'average' color
-      c[3] = settings.colors[Math.floor(a[4] * norm + 0.5)];
-    } else {
-      c[2] = 0; // disable the weak cluster
+    for (let i = 0; i < clusters.length; ++i) {
+        let c = clusters[i];
+        const a = accums[i];
+        if (a[0] > minClusterSize) {
+            const norm = 1 / a[0];
+            const new_r = 1.1 * Math.sqrt(a[3] * norm); // with 10% extra room
+            c[2] = 0.95 * c[2] + 0.05 * new_r; // exponential smoothing
+            // 'average' color
+            c[3] = settings.colors[Math.floor(a[4] * norm + 0.5)];
+        } else {
+            c[2] = 0; // disable the weak cluster
+        }
     }
-  }
-  // note: if half of the particles are not within the average
-  // radius of the cluster, we should probably split it in two
-  // along the main axis!
+    // note: if half of the particles are not within the average
+    // radius of the cluster, we should probably split it in two
+    // along the main axis!
 }
+
 function trackClusters() {
-  addNewClusters(maxClusters);
-  let accums = [];
-  for (const c of clusters) accums.push([0, 0, 0, 0, 0]);
-  const maxKMeanPasses = 10;
-  for (let pass = maxKMeanPasses; pass >= 0; --pass) {
-    for (let a of accums) a = [0, 0, 0, 0, 0];
-    for (const c of atoms) {
-      const [best, best_d2] = findNearestCluster(c[0], c[1]);
-      if (best >= 0 && best_d2 < maxRadius * maxRadius) {
-        accums[best][0] += 1;
-        accums[best][1] += c[0];
-        accums[best][2] += c[1];
-        accums[best][3] += best_d2;
-        accums[best][4] += c[4];
-      }
+    addNewClusters(maxClusters);
+    const accums = getClusterAccums(clusters.length);
+    const atomCount = atoms.length;
+    const maxKMeanPasses = 10;
+    for (let pass = maxKMeanPasses; pass >= 0; --pass) {
+        for (let i = 0; i < atomCount; ++i) {
+            const c = atoms[i];
+            const [best, best_d2] = findNearestCluster(c[0], c[1]);
+            if (best >= 0 && best_d2 < maxRadiusSquared) {
+                accums[best][0] += 1;
+                accums[best][1] += c[0];
+                accums[best][2] += c[1];
+                accums[best][3] += best_d2;
+                accums[best][4] += c[4];
+            }
+        }
+        const max_d = moveClusters(accums);
+        if (max_d < 1) break;
     }
-    const max_d = moveClusters(accums);
-    if (max_d < 1) break;
-  }
-  finalizeClusters(accums);
+    finalizeClusters(accums);
 }
+
 function drawClusters() {
-  let i = 0;
-  while (i < clusters.length) {
-    let c = clusters[i];
-    if (c[2] > 0) {
-      drawCircle(c[0], c[1], c[3], c[2], false);
-      ++i;
-    } else {
-      // remove cluster by swapping with last
-      const last = clusters.pop();
-      if (i < clusters.length) clusters[i] = last;
+    let i = 0;
+    while (i < clusters.length) {
+        let c = clusters[i];
+        if (c[2] > 0) {
+            drawCircle(c[0], c[1], c[3], c[2], false);
+            ++i;
+        } else {
+            // remove cluster by swapping with last
+            const last = clusters.pop();
+            if (i < clusters.length) clusters[i] = last;
+        }
     }
-  }
 }
 
 // Canvas Dimensions
@@ -775,39 +1002,40 @@ updateCanvasDimensions();
 // Params for click-based pulse event
 var pulse = 0;
 var pulse_x = 0,
-  pulse_y = 0;
+    pulse_y = 0;
 
 var exploration_timer = 0;
+
 function exploreParameters() {
-  if (exploration_timer <= 0) {
-    let c1 = settings.colors[Math.floor(mulberry32() * settings.numColors)];
-    if (mulberry32() >= 0.2) {
-      // 80% of the time, we change the strength
-      let c2 = settings.colors[Math.floor(mulberry32() * settings.numColors)];
-      let new_strength = mulberry32();
-      // for better results, we force opposite-signed values
-      if (settings.rules[c1][c2] > 0) new_strength = -new_strength;
-      settings.rules[c1][c2] = new_strength;
-    } else {
-      // ...otherwise, the radius
-      settings.radii[c1] = 1 + Math.floor(mulberry32() * maxRadius);
+    if (exploration_timer <= 0) {
+        let c1 = settings.colors[Math.floor(mulberry32() * settings.numColors)];
+        if (mulberry32() >= 0.2) {
+            // 80% of the time, we change the strength
+            let c2 = settings.colors[Math.floor(mulberry32() * settings.numColors)];
+            let new_strength = mulberry32();
+            // for better results, we force opposite-signed values
+            if (settings.rules[c1][c2] > 0) new_strength = -new_strength;
+            settings.rules[c1][c2] = new_strength;
+        } else {
+            // ...otherwise, the radius
+            settings.radii[c1] = 1 + Math.floor(mulberry32() * maxRadius);
+        }
+        flattenRules();
+        exploration_timer = settings.explorePeriod;
     }
-    flattenRules();
-    exploration_timer = settings.explorePeriod;
-  }
-  exploration_timer -= 1;
+    exploration_timer -= 1;
 }
 
 var total_v = 0; // global velocity as a estimate of on-screen activity
 
 // Apply Rules ( How atoms interact with each other )
 const applyRules = () => {
-  if (settings.drawings.lines && !lineWarningShown) {
-    console.warn("Draw Lines is disabled while applyRules runs on the server.");
-    lineWarningShown = true;
-  }
+    if (settings.drawings.lines && !lineWarningShown) {
+        console.warn("Draw Lines is disabled while applyRules runs on the server.");
+        lineWarningShown = true;
+    }
 
-  applyRulesOnServer();
+    applyRulesOnServer();
 };
 
 // Generate Rules
@@ -824,57 +1052,127 @@ setupGUI();
 
 console.log("settings", settings);
 
+let framesSinceLastRequest = 0;
+var lastT = Date.now();
 update();
 
 function update() {
-  // Update Canvas Dimensions - if screen size changed
-  updateCanvasDimensions();
-  // Background color
-  m.fillStyle = settings.drawings.background_color;
-  m.fillRect(0, 0, canvas.width, canvas.height);
-  // Appy Rules
-  applyRules();
-  // Draw Atoms
-  for (const a of atoms) {
-    if (settings.drawings.circle) {
-      drawCircle(a[0], a[1], settings.colors[a[4]], settings.atoms.radius);
+    // Update Canvas Dimensions - if screen size changed
+    updateCanvasDimensions();
+    // Background color
+    const drawings = settings.drawings;
+    const colors = settings.colors;
+    const atomRadius = settings.atoms.radius;
+    m.fillStyle = drawings.background_color;
+    m.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Apply Rules with manual frame rate control
+    if (!settings.manual_frame_rate) {
+        applyRules();
     } else {
-      drawSquare(a[0], a[1], settings.colors[a[4]], settings.atoms.radius);
+        if (settings.time_scale > 1) {
+            // Request multiple frames for acceleration (sequentially)
+            const frameCount = Math.round(settings.time_scale);
+            for (let i = 0; i < frameCount; i++) {
+                // Use setTimeout to ensure sequential requests
+                setTimeout(() => applyRules(), i * 10);
+            }
+        } else {
+            // Skip frames for deceleration
+            const frameSkip = Math.round(1 / settings.time_scale);
+            framesSinceLastRequest++;
+            if (framesSinceLastRequest >= frameSkip) {
+                applyRules();
+                framesSinceLastRequest = 0;
+            }
+        }
     }
-  }
-  if (settings.drawings.clusters) {
-    trackClusters();
-    drawClusters();
-  }
+    // Draw Atoms
+    const atomCount = atoms.length;
+    if (drawings.circle) {
+        for (let i = 0; i < atomCount; ++i) {
+            const a = atoms[i];
+            drawCircle(a[0], a[1], colors[a[4]], atomRadius);
+        }
+    } else {
+        for (let i = 0; i < atomCount; ++i) {
+            const a = atoms[i];
+            drawSquare(a[0], a[1], colors[a[4]], atomRadius);
+        }
+    }
+    if (drawings.clusters) {
+        trackClusters();
+        drawClusters();
+    }
 
-  updateParams();
+    updateParams();
 
-  // const inRange = (a) => 0 <= a[0] && a[0] < canvas.width && 0 <= a[1] && a[1] < canvas.height
-  // console.log('inRange', atoms.filter(inRange).length)
+    // const inRange = (a) => 0 <= a[0] && a[0] < canvas.width && 0 <= a[1] && a[1] < canvas.height
+    // console.log('inRange', atoms.filter(inRange).length)
 
-  requestAnimationFrame(update);
+    requestAnimationFrame(update);
+}
+
+async function getClientFps() {
+    var curT = Date.now();
+    if (curT > await lastT) {
+        const new_fps = 1000. / (curT - lastT);
+        settings.clientFps = Math.round(settings.clientFps * 0.8 + new_fps * 0.2)
+        lastT = curT;
+    }
 }
 
 // post-frame stats and updates
 function updateParams() {
-  // adapt time_scale based on activity
-  if (total_v > 30 && settings.time_scale > 5) settings.time_scale /= 1.1;
-  if (settings.time_scale < 0.9) settings.time_scale *= 1.01;
-  if (settings.time_scale > 1.1) settings.time_scale /= 1.01;
+    getClientFps();
+    // adapt force_scale based on activity
+    if (total_v > 30 && settings.force_scale > 5) settings.force_scale /= 1.1;
+    if (pulse != 0) pulse -= pulse > 0 ? 1 : -1;
+    if (settings.explore) exploreParameters();
+}
 
-  if (pulse != 0) pulse -= pulse > 0 ? 1 : -1;
-  if (settings.explore) exploreParameters();
+// Build CSV from smart chunking results and download
+// Each row: round, phase, particles_per_thread, average_fps
+function buildSmartChunkingCSV() {
+    if (!smartChunking.results || smartChunking.results.length === 0) return "";
+    const rows = [];
+    // header
+    rows.push(["round", "phase", "particles_per_thread", "average_fps"].join(","));
+
+    for (let i = 0; i < smartChunking.results.length; ++i) {
+        const r = smartChunking.results[i];
+        for (let idx = 0; idx < r.sizes.length; ++idx) {
+            const size = r.sizes[idx];
+            const fps = r.fps[idx];
+            const fpsStr = fps == null || !Number.isFinite(fps) ? "" : fps.toFixed(2);
+            // push as a single row
+            rows.push([i, r.phase, size, fpsStr].join(","));
+        }
+    }
+
+    return rows.join("\n");
+}
+
+function downloadSmartChunkingResults() {
+    const csv = buildSmartChunkingCSV();
+    if (!csv) return;
+    const blob = new Blob([csv], {type: "text/csv"});
+    const url = URL.createObjectURL(blob);
+    const name = `smart_chunking_results_${settings.seed}.csv`;
+    dataURL_downloader(url, name);
+    // free the object URL after a short delay
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // Download DataURL
 function dataURL_downloader(dataURL, name = `particle_life_${settings.seed}`) {
-  const hyperlink = document.createElement("a");
-  // document.body.appendChild(hyperlink);
-  hyperlink.download = name;
-  hyperlink.target = "_blank";
-  hyperlink.href = dataURL;
-  hyperlink.click();
-  hyperlink.remove();
+    const hyperlink = document.createElement("a");
+    // document.body.appendChild(hyperlink);
+    hyperlink.download = name;
+    hyperlink.target = "_blank";
+    hyperlink.href = dataURL;
+    hyperlink.click();
+    hyperlink.remove();
 }
 
 // Recorde a video ----------------------------------
@@ -886,22 +1184,26 @@ const mediaRecorder = new MediaRecorder(videoStream);
 let chunks = [];
 // Store chanks
 mediaRecorder.ondataavailable = function (e) {
-  chunks.push(e.data);
+    chunks.push(e.data);
 };
 // Download video after recording is stopped
 mediaRecorder.onstop = function (e) {
-  // Chunks ---> Blob
-  const blob = new Blob(chunks, { type: "video/mp4" });
-  // Blob -----> DataURL
-  const videoDataURL = URL.createObjectURL(blob);
+    // Chunks ---> Blob
+    const blob = new Blob(chunks, {type: "video/mp4"});
+    // Blob -----> DataURL
+    const videoDataURL = URL.createObjectURL(blob);
 
-  // Download video
-  dataURL_downloader(videoDataURL);
+    // Download video
+    dataURL_downloader(videoDataURL);
 
-  // Reset Chunks
-  chunks = [];
+    // Reset Chunks
+    chunks = [];
 };
 
 // mediaRecorder.start(); // Start recording
 // mediaRecorder.stop(); // Stop recording
 // --------------------------------------------------
+
+setInterval(() => {
+    settings.framesThisSecond = 0
+}, 1000)
